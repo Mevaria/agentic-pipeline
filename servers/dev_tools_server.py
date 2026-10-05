@@ -13,10 +13,12 @@ Configuration (environment variables):
     BASE_BRANCH        Branch that changes are compared against. Defaults to main.
     PROTECTED_BRANCHES Comma-separated branches that may never be pushed.
     NOTIFICATIONS_LOG  File that outcome notifications are appended to.
+    FAIL_FIRST_WORKTREE Folder for the throwaway worktree the fail-first check runs in.
 """
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -31,6 +33,11 @@ SEVERITY_ORDER = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
 OUTPUT_LIMIT = 3000
 # Seconds a test run or scan may take before it is abandoned and reported as failed.
 COMMAND_TIMEOUT = 300
+# This folder, which holds the pytest_outcomes plugin, and the pipeline's own root one level up.
+PLUGIN_DIR = Path(__file__).resolve().parent
+PIPELINE_ROOT = PLUGIN_DIR.parent
+# Statuses the fail-first check gives a test: failed on an assertion, passed already, or did not run properly.
+RED, PASSES, BROKEN = "red", "passes", "broken"
 
 # The server itself. Functions decorated with @mcp.tool() are exposed to clients as MCP tools,
 # and FastMCP uses each function's docstring as the tool description the model reads.
@@ -72,12 +79,23 @@ def get_base_branch():
     return os.environ.get("BASE_BRANCH", "main")
 
 
-def run_command(args, cwd):
-    """Run a command without a shell and return (exit_code, stdout, stderr)."""
+def get_fail_first_worktree():
+    """Return the folder for the fail-first check's worktree, defaulting to runs/fail_first_worktree in the pipeline."""
+    # A fixed path, not a random temp folder, so a run that crashed leaves it where the next run can find and remove it.
+    default = PIPELINE_ROOT / "runs" / "fail_first_worktree"
+    return Path(os.environ.get("FAIL_FIRST_WORKTREE", default)).resolve()
+
+
+def run_command(args, cwd, env=None):
+    """Run a command without a shell and return (exit_code, stdout, stderr).
+
+    env replaces the child's environment when given; otherwise the server's own is inherited.
+    """
     try:
         result = subprocess.run(
             args,
             cwd=cwd,
+            env=env,
             # This server talks to its client over stdin, so child processes
             # get an empty input instead of inheriting the protocol channel.
             stdin=subprocess.DEVNULL,
@@ -280,6 +298,122 @@ def run_security_scan() -> dict:
         "blocking_dependency_findings": blocking_dependencies,
         "non_blocking_dependency_findings": non_blocking_dependencies,
         "errors": errors,
+    }
+
+
+def remove_worktree(repo_path, worktree):
+    """Remove a worktree folder and its registration in the repository, whether or not git still recognises it."""
+    if worktree.exists():
+        # --force removes it even with untracked or modified files in it, such as the tests written for a check.
+        run_command(["git", "worktree", "remove", "--force", str(worktree)], repo_path)
+    # A folder git no longer recognises, for example one left by a run against another repository, is deleted directly.
+    if worktree.exists():
+        shutil.rmtree(worktree, ignore_errors=True)
+    # Drop registrations whose folders are gone, so the same path can be used again.
+    run_command(["git", "worktree", "prune"], repo_path)
+
+
+def classify_outcomes(outcomes, test_files):
+    """Turn the plugin's raw records into one entry per test with a status of red, passes or broken.
+
+    A test is red only when its body failed on an assertion or a pytest.fail,
+    which includes pytest.raises reporting DID NOT RAISE. A test that passed
+    does not test the requested behaviour. Anything else, such as a failed
+    import, a failed fixture, a skip or another exception, is broken. A given
+    file that produced no test at all is reported as broken too.
+    """
+    results = []
+    for nodeid, phases in outcomes.items():
+        # A file that failed to import never produced tests, so the file itself is the entry.
+        if "collect" in phases:
+            results.append({"test": nodeid, "status": BROKEN, "detail": f"could not be collected: {phases['collect']['message']}"})
+            continue
+        # The plugin records setup only when it failed or skipped, and then the body never ran.
+        setup = phases.get("setup")
+        if setup is not None:
+            detail = f"setup failed: {setup['message']}" if setup["outcome"] == "failed" else "skipped"
+            results.append({"test": nodeid, "status": BROKEN, "detail": detail})
+            continue
+        call = phases.get("call")
+        if call is None:
+            continue
+        if call["outcome"] == "passed":
+            status, detail = PASSES, "passed before any change was made, so it does not test the requested behaviour"
+        elif call["outcome"] == "failed" and (call["is_assertion"] or call["is_pytest_fail"]):
+            status, detail = RED, call["message"]
+        elif call["outcome"] == "failed":
+            status, detail = BROKEN, f"raised {call['exception']} instead of failing an assertion: {call['message']}"
+        else:
+            status, detail = BROKEN, "skipped"
+        results.append({"test": nodeid, "status": status, "detail": detail})
+    # pytest node ids start with the file's path, so a file with no entry produced no tests.
+    for path in test_files:
+        if not any(entry["test"].startswith(path) for entry in results):
+            results.append({"test": path, "status": BROKEN, "detail": "no tests were collected from this file"})
+    return results
+
+
+@mcp.tool()
+def check_tests_fail(tests: dict[str, str]) -> dict:
+    """Check that new tests fail on the base branch, before any change is made.
+
+    tests maps a path relative to the repository root, such as "tests/test_x.py",
+    to the file's content. The tests run in a throwaway worktree of the base
+    branch, so the repository itself is never touched. Every test must fail on
+    an assertion to count as red: a test that passes does not test the requested
+    behaviour, and a test that errors, on an import, a fixture or a typo, is
+    broken. Returns all_red and one entry per test with its status and detail.
+    """
+    repo_path = get_repo_path()
+    base_branch = get_base_branch()
+    worktree = get_fail_first_worktree()
+    # Whatever a crashed run left behind is cleared first, so the add below starts from a free path.
+    remove_worktree(repo_path, worktree)
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    # --detach checks out the commit rather than the branch, since a branch cannot be checked out in two places.
+    exit_code, _, stderr = run_command(["git", "worktree", "add", "--detach", str(worktree), base_branch], repo_path)
+    if exit_code != 0:
+        return {"all_red": False, "tests": [], "error": f"Could not create a worktree of '{base_branch}': {tail(stderr, 300).strip()}"}
+    # The plugin writes here; it sits next to the worktree, not inside it, so removing the worktree cannot lose it.
+    outcomes_file = worktree.parent / "fail_first_outcomes.json"
+    try:
+        paths = []
+        for relative_path, content in tests.items():
+            # The same containment check as run_tests, applied to the worktree, so a path cannot escape it.
+            target = resolve_inside_repo(worktree, relative_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            paths.append(str(target))
+        environment = {
+            **os.environ,
+            "PYTEST_OUTCOMES_FILE": str(outcomes_file),
+            # The plugin's folder goes first on PYTHONPATH so "-p pytest_outcomes" can import it.
+            "PYTHONPATH": os.pathsep.join(part for part in (str(PLUGIN_DIR), os.environ.get("PYTHONPATH", "")) if part),
+        }
+        args = [
+            sys.executable, "-m", "pytest", "-q", "--tb=short", "-p", "no:cacheprovider",
+            "-p", "pytest_outcomes",
+            # Without this, one file that fails to import stops the whole run and hides every other verdict.
+            "--continue-on-collection-errors",
+            # Only the new files run; the existing suite is expected to pass and is not the question here.
+            *paths,
+        ]
+        exit_code, stdout, stderr = run_command(args, worktree, env=environment)
+        try:
+            outcomes = json.loads(outcomes_file.read_text(encoding="utf-8"))
+        # No file means pytest never reached the end of the session, for example a bad argument or a crash.
+        except (OSError, ValueError):
+            return {"all_red": False, "tests": [], "error": f"pytest did not report outcomes: {tail(stdout + stderr, 500)}"}
+        results = classify_outcomes(outcomes, [path.replace("\\", "/") for path in tests])
+    finally:
+        # Always runs, including on an exception above, so a failed check never leaves the worktree behind.
+        remove_worktree(repo_path, worktree)
+        outcomes_file.unlink(missing_ok=True)
+    return {
+        # An empty result list is not a pass: at least one test must exist and all of them must be red.
+        "all_red": bool(results) and all(entry["status"] == RED for entry in results),
+        "tests": results,
+        "output": tail(stdout + stderr),
     }
 
 

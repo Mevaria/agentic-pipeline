@@ -40,9 +40,9 @@ def test_index():
 
 
 def git(args, cwd):
-    """Run a git command in the given folder and fail the test if it errors."""
+    """Run a git command in the given folder, fail the test if it errors, and return its output."""
     # check=True raises on a non-zero exit, so a broken fixture fails loudly at the git step.
-    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
 
 
 @pytest.fixture
@@ -69,6 +69,8 @@ def repo(tmp_path, monkeypatch):
     # The server reads its repository from the environment; monkeypatch undoes this after the test.
     monkeypatch.setenv("TARGET_REPO_PATH", str(work))
     monkeypatch.setenv("NOTIFICATIONS_LOG", str(tmp_path / "notifications.log"))
+    # The fail-first check's worktree goes under the test's temp folder, not the pipeline's runs folder.
+    monkeypatch.setenv("FAIL_FIRST_WORKTREE", str(tmp_path / "fail_first_worktree"))
     return work
 
 
@@ -204,3 +206,124 @@ def test_unknown_base_branch_fails_closed(monkeypatch):
     result = server.run_security_scan()
     assert result["blocking"] is True
     assert result["errors"]
+
+
+# Three tests for a route the throwaway app does not have, each failing in a different legitimate way:
+# a plain assert, an assert with a custom message, and pytest.raises reporting DID NOT RAISE.
+RED_TESTS = '''import pytest
+
+from app import create_app
+
+
+def test_missing_route():
+    assert create_app().test_client().get("/missing").status_code == 200
+
+
+def test_missing_route_with_message():
+    assert create_app().test_client().get("/missing").status_code == 200, "the route should exist"
+
+
+def test_nothing_raised():
+    with pytest.raises(ValueError):
+        create_app()
+'''
+
+# A test of behaviour the app already has, which passes before any change is made.
+PASSING_TEST = '''from app import create_app
+
+
+def test_index_already_works():
+    assert create_app().test_client().get("/").status_code == 200
+'''
+
+# Tests that go wrong without reaching an assertion: a TypeError in the body and a fixture that raises.
+ERRORING_TESTS = '''import pytest
+
+from app import create_app
+
+
+@pytest.fixture
+def exploding():
+    raise RuntimeError("fixture exploded")
+
+
+def test_body_error():
+    return create_app().test_client().get("/missing").get_json()["id"]
+
+
+def test_setup_error(exploding):
+    assert True
+'''
+
+# A file that fails to import, because the name does not exist yet.
+IMPORT_ERROR_TEST = '''from app import not_there_yet
+
+
+def test_new_symbol():
+    assert not_there_yet() == 1
+'''
+
+
+def statuses(result):
+    """Map each test's node id to its status, so assertions can name tests rather than count on order."""
+    return {entry["test"]: entry["status"] for entry in result["tests"]}
+
+
+@pytest.mark.usefixtures("repo")
+def test_check_tests_fail_accepts_assertion_failures():
+    """check_tests_fail on tests that fail by plain assert, assert with a message, and DID NOT RAISE reports all three as red and all_red=True."""
+    result = server.check_tests_fail({"tests/test_new.py": RED_TESTS})
+    assert result["all_red"] is True
+    assert set(statuses(result).values()) == {"red"}
+    assert len(result["tests"]) == 3
+
+
+@pytest.mark.usefixtures("repo")
+def test_check_tests_fail_rejects_a_passing_test():
+    """check_tests_fail on a test that already passes reports it as passes and all_red=False, even alongside red tests."""
+    result = server.check_tests_fail({"tests/test_new.py": RED_TESTS, "tests/test_old.py": PASSING_TEST})
+    assert result["all_red"] is False
+    assert statuses(result)["tests/test_old.py::test_index_already_works"] == "passes"
+    assert statuses(result)["tests/test_new.py::test_missing_route"] == "red"
+
+
+@pytest.mark.usefixtures("repo")
+def test_check_tests_fail_rejects_errors():
+    """check_tests_fail on tests that raise in the body, fail in a fixture, or fail to import reports each as broken, with the import failure named by file."""
+    result = server.check_tests_fail({"tests/test_errors.py": ERRORING_TESTS, "tests/test_import.py": IMPORT_ERROR_TEST})
+    assert result["all_red"] is False
+    found = statuses(result)
+    assert found["tests/test_errors.py::test_body_error"] == "broken"
+    assert found["tests/test_errors.py::test_setup_error"] == "broken"
+    assert found["tests/test_import.py"] == "broken"
+    assert set(found.values()) == {"broken"}
+
+
+@pytest.mark.usefixtures("repo")
+def test_check_tests_fail_rejects_a_file_with_no_tests():
+    """check_tests_fail on a file that defines no test reports the file as broken rather than vacuously red."""
+    result = server.check_tests_fail({"tests/test_empty.py": "VALUE = 1\n"})
+    assert result["all_red"] is False
+    assert statuses(result) == {"tests/test_empty.py": "broken"}
+
+
+def test_check_tests_fail_leaves_the_repository_untouched(repo, tmp_path):
+    """After check_tests_fail, the repository has no new files or worktrees and the worktree folder is gone."""
+    server.check_tests_fail({"tests/test_new.py": RED_TESTS})
+    assert git(["status", "--porcelain"], repo).strip() == ""
+    assert not (repo / "tests" / "test_new.py").exists()
+    assert not (tmp_path / "fail_first_worktree").exists()
+    # git worktree list prints the main checkout first; any extra line would be a worktree left behind.
+    assert len(git(["worktree", "list"], repo).strip().splitlines()) == 1
+
+
+def test_check_tests_fail_removes_a_stale_worktree(repo, tmp_path):
+    """With a worktree left behind by an earlier run at the configured path, check_tests_fail removes it, runs normally, and leaves nothing behind."""
+    stale = tmp_path / "fail_first_worktree"
+    git(["worktree", "add", "--detach", str(stale), "main"], repo)
+    # A stray file makes the stale worktree dirty, which a plain removal would refuse.
+    (stale / "leftover.txt").write_text("from a crashed run")
+    result = server.check_tests_fail({"tests/test_new.py": RED_TESTS})
+    assert result["all_red"] is True
+    assert not stale.exists()
+    assert len(git(["worktree", "list"], repo).strip().splitlines()) == 1
