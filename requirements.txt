@@ -1,0 +1,10 @@
+mcp>=1.29,<2
+mcp-server-git>=2026.1
+langchain-mcp-adapters>=0.3
+langchain-ollama>=1.0
+langgraph>=1.0
+python-dotenv>=1.0
+bandit>=1.7
+pip-audit>=2.7
+pytest>=8.0
+flask>=3.0
