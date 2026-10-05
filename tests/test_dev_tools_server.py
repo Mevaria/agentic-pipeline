@@ -4,11 +4,13 @@ Each test builds a throwaway git repository from a small Flask app, with a bare
 repository standing in for GitHub, so pushes can be checked safely.
 """
 
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from pipeline.run_implementer import load_task
 from servers import dev_tools_server as server
 
 # Tests that need a fixture's setup but never use its return value declare it with
@@ -71,6 +73,9 @@ def repo(tmp_path, monkeypatch):
     monkeypatch.setenv("NOTIFICATIONS_LOG", str(tmp_path / "notifications.log"))
     # The fail-first check's worktree goes under the test's temp folder, not the pipeline's runs folder.
     monkeypatch.setenv("FAIL_FIRST_WORKTREE", str(tmp_path / "fail_first_worktree"))
+    # Generated task folders go under the temp folder too, with a fixed run id so tests can find them.
+    monkeypatch.setenv("TASKS_PATH", str(tmp_path / "tasks"))
+    monkeypatch.setenv("RUN_ID", "run-1")
     return work
 
 
@@ -327,3 +332,62 @@ def test_check_tests_fail_removes_a_stale_worktree(repo, tmp_path):
     assert result["all_red"] is True
     assert not stale.exists()
     assert len(git(["worktree", "list"], repo).strip().splitlines()) == 1
+
+
+@pytest.mark.usefixtures("repo")
+def test_write_task_spec_saves_task_json(tmp_path):
+    """write_task_spec with a valid type, slug and spec writes task.json under TASKS_PATH/RUN_ID and reports the folder."""
+    result = server.write_task_spec("feat", "delete-book", "Add DELETE /api/books/<id>.")
+    assert result["saved"] is True
+    assert Path(result["task_folder"]) == tmp_path / "tasks" / "run-1"
+    task = json.loads((tmp_path / "tasks" / "run-1" / "task.json").read_text())
+    assert task == {"type": "feat", "short_description": "delete-book", "spec": "Add DELETE /api/books/<id>."}
+
+
+@pytest.mark.usefixtures("repo")
+def test_write_task_spec_rejects_bad_type_slug_or_spec(tmp_path):
+    """write_task_spec with an unknown type, a slug that is not lowercase-hyphenated, or an empty spec reports saved=False and writes nothing."""
+    assert server.write_task_spec("feature", "delete-book", "spec")["saved"] is False
+    assert server.write_task_spec("feat", "Delete Book", "spec")["saved"] is False
+    assert server.write_task_spec("feat", "delete-book", "   ")["saved"] is False
+    assert not (tmp_path / "tasks" / "run-1").exists()
+
+
+@pytest.mark.usefixtures("repo")
+def test_write_task_test_saves_under_the_task_folder(tmp_path):
+    """write_task_test with a new test_*.py name writes the content into the run's tests subfolder."""
+    result = server.write_task_test("test_delete_book.py", RED_TESTS)
+    assert result["saved"] is True
+    path = tmp_path / "tasks" / "run-1" / "tests" / "test_delete_book.py"
+    assert Path(result["path"]) == path
+    assert path.read_text(encoding="utf-8") == RED_TESTS
+
+
+@pytest.mark.usefixtures("repo")
+def test_write_task_test_refuses_a_name_the_repository_already_has(tmp_path):
+    """write_task_test with the name of a test file already in the repository's tests folder reports saved=False with an error naming it, and writes nothing."""
+    result = server.write_task_test("test_app.py", RED_TESTS)
+    assert result["saved"] is False
+    assert "test_app.py" in result["error"]
+    assert not (tmp_path / "tasks" / "run-1").exists()
+
+
+@pytest.mark.usefixtures("repo")
+def test_write_task_test_rejects_bad_names_and_empty_content(tmp_path):
+    """write_task_test with a path, a non-test name, a non-.py name or empty content reports saved=False and writes nothing."""
+    assert server.write_task_test("../test_escape.py", RED_TESTS)["saved"] is False
+    assert server.write_task_test("helpers.py", RED_TESTS)["saved"] is False
+    assert server.write_task_test("test_notes.txt", RED_TESTS)["saved"] is False
+    assert server.write_task_test("test_empty.py", "  \n")["saved"] is False
+    assert not (tmp_path / "tasks" / "run-1").exists()
+
+
+@pytest.mark.usefixtures("repo")
+def test_task_folder_is_what_the_implementer_loads():
+    """After write_task_spec and write_task_test, load_task on the reported folder returns the task with its tests keyed by repository path."""
+    folder = server.write_task_spec("fix", "blank-title", "Reject a title of only spaces.")["task_folder"]
+    server.write_task_test("test_blank_title.py", RED_TESTS)
+    task = load_task(folder)
+    assert task["type"] == "fix"
+    assert task["short_description"] == "blank-title"
+    assert task["tests"] == {"tests/test_blank_title.py": RED_TESTS}

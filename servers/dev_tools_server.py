@@ -14,10 +14,13 @@ Configuration (environment variables):
     PROTECTED_BRANCHES Comma-separated branches that may never be pushed.
     NOTIFICATIONS_LOG  File that outcome notifications are appended to.
     FAIL_FIRST_WORKTREE Folder for the throwaway worktree the fail-first check runs in.
+    TASKS_PATH         Folder that generated task folders are written under. Defaults to runs/tasks.
+    RUN_ID             Name of this run's task folder under TASKS_PATH. Set by the pipeline per run.
 """
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -38,6 +41,18 @@ PLUGIN_DIR = Path(__file__).resolve().parent
 PIPELINE_ROOT = PLUGIN_DIR.parent
 # Statuses the fail-first check gives a test: failed on an assertion, passed already, or did not run properly.
 RED, PASSES, BROKEN = "red", "passes", "broken"
+# Folder inside the target repository that holds its tests; generated test files are added to it later.
+TESTS_DIR = "tests"
+# Task types a generated task may have. They become the branch prefix and the commit type, so they
+# match the Conventional Commits types the implementer accepts.
+TASK_TYPES = {"feat", "fix", "refactor", "test", "docs", "chore", "perf", "style", "build", "ci"}
+# A short description is a lowercase slug: words of letters and digits joined by single hyphens.
+SLUG_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+SLUG_LIMIT = 50
+# A generated test file is a bare pytest module name: no folders, no other extension.
+TEST_FILE_PATTERN = re.compile(r"^test_[a-z0-9_]+\.py$")
+# Used when the pipeline did not set RUN_ID, so a server started by hand still writes somewhere sensible.
+DEFAULT_RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
 # The server itself. Functions decorated with @mcp.tool() are exposed to clients as MCP tools,
 # and FastMCP uses each function's docstring as the tool description the model reads.
@@ -84,6 +99,14 @@ def get_fail_first_worktree():
     # A fixed path, not a random temp folder, so a run that crashed leaves it where the next run can find and remove it.
     default = PIPELINE_ROOT / "runs" / "fail_first_worktree"
     return Path(os.environ.get("FAIL_FIRST_WORKTREE", default)).resolve()
+
+
+def get_task_folder():
+    """Return this run's task folder, TASKS_PATH/RUN_ID, defaulting to runs/tasks in the pipeline."""
+    # Generated tasks are run output, so they live under the gitignored runs folder, not next to hand-written tasks.
+    tasks_path = Path(os.environ.get("TASKS_PATH", PIPELINE_ROOT / "runs" / "tasks")).resolve()
+    # One folder per run keeps a revised test from overwriting an earlier run's output.
+    return tasks_path / os.environ.get("RUN_ID", DEFAULT_RUN_ID)
 
 
 def run_command(args, cwd, env=None):
@@ -415,6 +438,57 @@ def check_tests_fail(tests: dict[str, str]) -> dict:
         "tests": results,
         "output": tail(stdout + stderr),
     }
+
+
+@mcp.tool()
+def write_task_spec(type: str, short_description: str, spec: str) -> dict:
+    """Save the task's type, short description and spec. Call once, before writing tests.
+
+    type is one of feat, fix, refactor, test, docs, chore, perf, style, build
+    or ci. short_description is a lowercase slug such as "delete-book"; it names
+    the branch. spec is the scoped description of the change in plain English:
+    what must change, what must not, and how the tests decide it is done.
+    """
+    # Each rule is checked in turn so the error names the first thing to fix.
+    if type not in TASK_TYPES:
+        return {"saved": False, "error": f"type must be one of {sorted(TASK_TYPES)}, got {type!r}"}
+    if not SLUG_PATTERN.match(short_description) or len(short_description) > SLUG_LIMIT:
+        return {"saved": False, "error": "short_description must be lowercase words joined by hyphens, "
+                                         f"at most {SLUG_LIMIT} characters, like 'delete-book'"}
+    if not spec.strip():
+        return {"saved": False, "error": "spec must not be empty"}
+    task_folder = get_task_folder()
+    task_folder.mkdir(parents=True, exist_ok=True)
+    # The same shape load_task in run_implementer reads, so the folder can go straight to the implementer.
+    task = {"type": type, "short_description": short_description, "spec": spec.strip()}
+    (task_folder / "task.json").write_text(json.dumps(task, indent=2) + "\n", encoding="utf-8")
+    return {"saved": True, "task_folder": str(task_folder)}
+
+
+@mcp.tool()
+def write_task_test(file_name: str, content: str) -> dict:
+    """Save one pytest file for the task. Call once per file; calling again replaces it.
+
+    file_name is a bare module name such as "test_delete_book.py", with no
+    folders. It must not be the name of a test file the repository already has,
+    because the file will be added to the repository's tests folder. content is
+    the complete file. Tests must reach the app only through its test client
+    and assert the status code before reading a response body.
+    """
+    if not TEST_FILE_PATTERN.match(file_name):
+        return {"saved": False, "error": "file_name must look like 'test_something.py', with no folders"}
+    # Prepare copies generated tests into the repository's tests folder and then protects every file there.
+    # A name clash would overwrite an existing suite and protect the overwritten version as if it were original.
+    if (get_repo_path() / TESTS_DIR / file_name).exists():
+        return {"saved": False, "error": f"{file_name} already exists in the repository's {TESTS_DIR} folder; choose a new name"}
+    if not content.strip():
+        return {"saved": False, "error": "content must not be empty"}
+    # Mirrors the layout of a hand-written task folder, with tests in a tests subfolder next to task.json.
+    tests_folder = get_task_folder() / TESTS_DIR
+    tests_folder.mkdir(parents=True, exist_ok=True)
+    path = tests_folder / file_name
+    path.write_text(content, encoding="utf-8")
+    return {"saved": True, "path": str(path)}
 
 
 @mcp.tool()
