@@ -1,0 +1,5 @@
+{
+  "type": "feat",
+  "short_description": "delete-book",
+  "spec": "Add a route DELETE /api/books/<book_id> to app.py. It removes the book with that id and returns status 204 with an empty body. If no book has that id, it returns status 404 with the JSON body {\"error\": \"Book not found\"}."
+}
