@@ -9,10 +9,8 @@ the spec and test author exists, these hand-written tests stand in for its outpu
 
 import argparse
 import asyncio
-import json
 import time
 from contextlib import AsyncExitStack
-from pathlib import Path
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
@@ -25,25 +23,9 @@ from pipeline.config import (
     select_tools,
 )
 from pipeline.implementer import build_implementer, recursion_limit
+# load_task is shared with the author; importing it here keeps "from pipeline.run_implementer import load_task" working.
+from pipeline.tasks import load_task
 from pipeline.tooling import open_tools
-
-
-def load_task(task_folder):
-    """Read a task folder into a dict with type, short_description, spec and a tests mapping.
-
-    The tests mapping goes from the path the file will have inside the target
-    repository, such as "tests/test_delete_book.py", to its full content.
-    """
-    folder = Path(task_folder)
-    task = json.loads((folder / "task.json").read_text(encoding="utf-8"))
-    tests_folder = folder / "tests"
-    # Keys are repository-relative so the implementer can write them straight into the target's tests folder.
-    # sorted() keeps the order stable between runs; a task without tests gets an empty mapping.
-    task["tests"] = {
-        f"tests/{path.name}": path.read_text(encoding="utf-8")
-        for path in sorted(tests_folder.glob("*.py"))
-    } if tests_folder.exists() else {}
-    return task
 
 
 async def main(task_folder):

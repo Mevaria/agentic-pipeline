@@ -8,6 +8,7 @@ allowlist, so least privilege is enforced here rather than in prompts.
 import os
 import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -69,6 +70,27 @@ def get_implementer_settings():
     }
 
 
+def get_author_settings():
+    """Return the spec and test author's settings: revision cap and tool steps per attempt."""
+    return {
+        # Revisions after the first attempt before the run stops as blocked or not reproducible.
+        "max_revisions": get_int("MAX_AUTHOR_REVISIONS", 2),
+        # Tool calls the model may make within one attempt before the fail-first check is forced.
+        "max_tool_steps": get_int("MAX_TOOL_STEPS", 12),
+    }
+
+
+def get_tasks_path():
+    """Return the folder generated task folders go under, defaulting to runs/tasks in this repository."""
+    # The dev tools server reads the same variable with the same default, so both sides agree on the folder.
+    return Path(os.environ.get("TASKS_PATH", PROJECT_ROOT / "runs" / "tasks")).resolve()
+
+
+def new_run_id():
+    """Return a run id from the current UTC time, which names the run's task folder."""
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+
 def find_npx():
     """Return the full path to npx, failing with install instructions when Node.js is missing."""
     # On Windows npx is a .cmd file, which shutil.which resolves to its full path.
@@ -123,6 +145,16 @@ AGENT_TOOLS = {
         "write_file",
         # Dev tools server. The model may run tests, but the run that decides pass or fail is done by code.
         "run_tests",
+    ],
+    "author": [
+        # Filesystem server, read-only: the author studies the code but never changes the target repository.
+        "list_directory",
+        "read_text_file",
+        # Dev tools server: the author's only writes go into its own task folder. The fail-first check
+        # is not listed, because code runs it at a fixed point; the model cannot judge its own tests.
+        "write_task_spec",
+        "write_task_test",
+        # request_clarification is not an MCP tool; pipeline/author.py defines it and adds it to this list.
     ],
 }
 
