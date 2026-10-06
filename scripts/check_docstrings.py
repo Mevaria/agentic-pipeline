@@ -13,8 +13,9 @@ from pathlib import Path
 
 # The repository root: this file lives in scripts/, so one level up.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-# Folders that hold third-party or generated code, which is not ours to document.
-SKIPPED_FOLDERS = {".venv", "venv", ".git", "__pycache__", ".pytest_cache", "node_modules"}
+# Folders that hold third-party or generated code, which is not ours to document. runs/ holds run output,
+# including test files the author wrote for a target repository, which follow that repository's rules.
+SKIPPED_FOLDERS = {".venv", "venv", ".git", "__pycache__", ".pytest_cache", "node_modules", "runs"}
 # AST node types that can carry a docstring, mapped to the label printed for them.
 DOCUMENTED_NODES = {
     ast.Module: "module",
