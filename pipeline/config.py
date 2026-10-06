@@ -71,8 +71,10 @@ def get_implementer_settings():
 
 
 def get_author_settings():
-    """Return the spec and test author's settings: revision cap and tool steps per attempt."""
+    """Return the spec and test author's settings: base branch, revision cap and tool steps per attempt."""
     return {
+        # The branch the author reads and the fail-first check runs against; the same one the implementer uses.
+        "base_branch": os.environ.get("BASE_BRANCH", "main"),
         # Revisions after the first attempt before the run stops as blocked or not reproducible.
         "max_revisions": get_int("MAX_AUTHOR_REVISIONS", 2),
         # Tool calls the model may make within one attempt before the fail-first check is forced.

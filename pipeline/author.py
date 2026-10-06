@@ -4,9 +4,9 @@ Turns a plain-English change request or bug report into a task folder the
 implementer can run: a scoped spec and tests, written before any
 implementation exists. The graph mixes model steps with code steps:
 
-    prepare   (code)   start the conversation with the request
+    prepare   (code)   refuse a dirty target, check out the base branch, start the conversation
     author    (model)  ReAct loop: read the code, write the spec and the tests
-    tools     (code)   execute the tool calls the model asked for
+    tools     (code)   execute the tool calls the model asked for; a clarification ends the attempt
     check     (code)   fail-first check: every new test must fail on an assertion
     revise    (code)   restart the author with the check's findings, up to the revision cap
     finish    (code)   the task folder is ready for the implementer
@@ -23,10 +23,11 @@ it has no side effect: it only signals the graph.
 """
 
 import json
+import shutil
 from pathlib import Path
 from typing import Annotated, Literal, TypedDict
 
-from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES, add_messages
@@ -39,6 +40,8 @@ from pipeline.tooling import call_tool
 TESTS_DIR = "tests"
 # Characters of a test's check detail passed back to the model, enough for the failure line.
 DETAIL_LIMIT = 300
+# Characters of each tool result written to the log, so a run shows what the tools said without flooding it.
+TOOL_LOG_LIMIT = 200
 # Task type under which tests that pass mean the reported bug could not be reproduced.
 BUG_TYPE = "fix"
 # The only reasons the author may give for asking a question instead of writing a spec.
@@ -76,6 +79,27 @@ def clarification_request(messages):
                 if call["name"] == "request_clarification" and call["args"].get("reason") in CLARIFICATION_REASONS:
                     return call["args"]["reason"], str(call["args"].get("question", "")).strip()
     return None
+
+
+def latest_tool_results(messages):
+    """Return the ToolMessages produced for the most recent AIMessage, in order."""
+    results = []
+    # Walk back from the end; the tool results sit after the AIMessage that asked for them.
+    for message in reversed(messages):
+        if isinstance(message, AIMessage):
+            break
+        if isinstance(message, ToolMessage):
+            results.insert(0, message)
+    return results
+
+
+def clarification_answered(messages):
+    """Return True when the latest tool results include a request_clarification call the tool accepted."""
+    # A call with a bad reason comes back with status "error", and must not end the attempt.
+    return any(
+        result.name == "request_clarification" and result.status != "error"
+        for result in latest_tool_results(messages)
+    )
 
 
 class AuthorState(TypedDict, total=False):
@@ -169,12 +193,17 @@ def build_author(repo_path, all_tools, agent_tools, model, settings, task_folder
 
     all_tools: every MCP tool, used by pipeline code at fixed points.
     agent_tools: the author's allowlist, the only tools the model can call.
-    settings: max_revisions, max_tool_steps.
+    settings: base_branch, max_revisions, max_tool_steps.
     task_folder: where the author's tools write for this run, TASKS_PATH/RUN_ID.
     """
     repo = str(Path(repo_path))
     task_folder = Path(task_folder)
     tools_by_name = {tool.name: tool for tool in all_tools}
+
+    async def git(name, **arguments):
+        """Call a Git server tool; every one of them takes the repository path as repo_path."""
+        return await call_tool(tools_by_name, name, {"repo_path": repo, **arguments})
+
     # The clarification tool is defined in this module, not on a server, so it is added to the allowlist here.
     agent_tools = [*agent_tools, request_clarification]
     # Binding the allowlist is what lets the model emit tool calls, and only for these tools.
@@ -190,9 +219,16 @@ def build_author(repo_path, all_tools, agent_tools, model, settings, task_folder
             HumanMessage(prompt),
         ]
 
-    def prepare(state):
-        """Code node: start the first attempt from the request."""
-        log(f"[prepare] task folder {task_folder}")
+    async def prepare(state):
+        """Code node: put the target on the base branch, so the author reads the code the check runs against."""
+        status = await git("git_status")
+        # Uncommitted changes would make the author describe code that is not on any branch.
+        if "working tree clean" not in status:
+            raise RuntimeError(f"The target repository has uncommitted changes:\n{status}")
+        # The fail-first check runs on the base branch; whatever branch happened to be checked out must not
+        # be what the author reads, or it could specify against code that is not in the base.
+        await git("git_checkout", branch_name=settings["base_branch"])
+        log(f"[prepare] on branch {settings['base_branch']}, task folder {task_folder}")
         return {
             "task_folder": str(task_folder),
             "revision": 0,
@@ -203,6 +239,9 @@ def build_author(repo_path, all_tools, agent_tools, model, settings, task_folder
 
     async def author(state):
         """Model node: one ReAct step, producing either tool calls or a final answer."""
+        # What the tools answered since the last step, so a run's log shows refusals and errors, not only call names.
+        for result in latest_tool_results(state["messages"]):
+            log(f"[tool] {result.name} ({result.status}): {str(result.content)[:TOOL_LOG_LIMIT]}")
         response = await model_with_tools.ainvoke(state["messages"])
         # Log the tool names so a run can be followed without printing the whole conversation.
         for tool_call in response.tool_calls:
@@ -221,12 +260,25 @@ def build_author(repo_path, all_tools, agent_tools, model, settings, task_folder
             log(f"[author] revision {state['revision']}: step limit reached")
         return "check"
 
+    def route_after_tools(state):
+        """Go straight to check once a clarification was accepted, so the model gets no further turns."""
+        if clarification_answered(state["messages"]):
+            # Logged here because the author node, which normally logs tool results, is skipped.
+            log(f"[tools] request_clarification accepted; ending the attempt")
+            return "check"
+        return "author"
+
     async def check(state):
         """Code node: load what the author wrote and run the fail-first check on its tests."""
         # A valid request_clarification call ends the run, whatever else was written.
         clarification = clarification_request(state["messages"])
         if clarification:
             reason, question = clarification
+            # Anything written before the question is incomplete by the author's own account, and a folder
+            # that looks usable must not be left for the implementer. The question is kept in the state.
+            if task_folder.exists():
+                shutil.rmtree(task_folder, ignore_errors=True)
+                log(f"[check] removed the partial task folder {task_folder}")
             log(f"[check] the author asked for clarification ({reason})")
             return {"status": "needs_clarification", "clarification_reason": reason, "question": question}
         # No spec and no clarification means the author wrote nothing useful, which is fed back as a failed attempt.
@@ -305,9 +357,10 @@ def build_author(repo_path, all_tools, agent_tools, model, settings, task_folder
     graph.add_node("not_reproducible", not_reproducible)
     graph.add_edge(START, "prepare")
     graph.add_edge("prepare", "author")
-    # The ReAct loop: author -> tools -> author, until the router sends the attempt to check.
+    # The ReAct loop: author -> tools -> author, until the router sends the attempt to check,
+    # or an accepted clarification ends it from the tools side.
     graph.add_conditional_edges("author", route_after_author, ["tools", "check"])
-    graph.add_edge("tools", "author")
+    graph.add_conditional_edges("tools", route_after_tools, ["author", "check"])
     # The revision loop: check -> revise -> author, until all red, a question, or the cap.
     graph.add_conditional_edges("check", route_after_check, ["finish", "clarify", "revise", "blocked", "not_reproducible"])
     graph.add_edge("revise", "author")

@@ -66,13 +66,21 @@ def test_list_books():
     assert create_app().test_client().get("/api/books").status_code == 200
 '''
 
+# The delete route as it might exist on a feature branch, used to show the author reads main instead.
+BRANCH_APP = APP.replace("    return app\n", '''    @app.delete("/api/books/<int:book_id>")
+    def delete_book(book_id):
+        return "", 204
+
+    return app
+''')
+
 REQUEST = "Add a route DELETE /api/books/<id> that removes the book and returns 204."
-SETTINGS = {"max_revisions": 2, "max_tool_steps": 12}
+SETTINGS = {"base_branch": "main", "max_revisions": 2, "max_tool_steps": 12}
 
 
 def git(args, cwd):
-    """Run a git command in the given folder and fail the test if it errors."""
-    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+    """Run a git command in the given folder, fail the test if it errors, and return its output."""
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
 
 
 @pytest.fixture
@@ -147,6 +155,17 @@ def write_test(content, number, file_name="test_delete_book.py"):
     return lambda messages: AIMessage(content="", tool_calls=[tool_call("write_task_test", arguments, number)])
 
 
+def read_file(repo, relative_path, number):
+    """A turn that reads a file from the repository, as the author does before writing."""
+    arguments = {"path": str(repo / relative_path)}
+    return lambda messages: AIMessage(content="", tool_calls=[tool_call("read_text_file", arguments, number)])
+
+
+def tool_results(state, name):
+    """Return the contents of every tool result with the given tool name, in order."""
+    return [str(message.content) for message in state["messages"] if getattr(message, "type", "") == "tool" and message.name == name]
+
+
 def ask(reason, question, number):
     """A turn that calls request_clarification with the given reason and question."""
     arguments = {"reason": reason, "question": question}
@@ -209,15 +228,44 @@ def test_bug_with_passing_tests_is_not_reproducible(repo, tmp_path):
     assert state["status"] == "not_reproducible"
 
 
-def test_request_clarification_ends_the_run_with_the_question(repo, tmp_path):
-    """With an author that calls request_clarification with a valid reason and then stops, the run ends as needs_clarification carrying the reason and question, with no task folder."""
+def test_request_clarification_ends_the_attempt_at_once(repo, tmp_path):
+    """With an author that writes a spec and then calls request_clarification with a valid reason, the run ends as needs_clarification carrying the reason and question, the model gets no further turn, and the partial task folder is removed."""
     question = "Should deleting a book that is marked as read be allowed, or refused with 409?"
-    agent = ScriptedAgent([ask("contradicts_existing", question, 1), done("I need an answer first.")])
+    agent = ScriptedAgent([write_spec("feat", 1), ask("contradicts_existing", question, 2), done("This turn must never be played.")])
     state = asyncio.run(run_graph(repo, agent, tmp_path))
     assert state["status"] == "needs_clarification"
     assert state["clarification_reason"] == "contradicts_existing"
     assert state["question"] == question
+    # The scripted turn after the clarification is still queued, so the model was not called again.
+    assert len(agent.turns) == 1
     assert not (tmp_path / "tasks" / "run-1").exists()
+
+
+def test_author_reads_the_base_branch_not_the_checked_out_one(repo, tmp_path):
+    """With the target checked out on a feature branch whose app.py already has the delete route, the author's read_text_file returns main's app.py without it, and the target is left on main."""
+    git(["checkout", "-b", "feat/delete-book"], repo)
+    (repo / "app.py").write_text(BRANCH_APP)
+    git(["commit", "-am", "feat: add delete route"], repo)
+    agent = ScriptedAgent([read_file(repo, "app.py", 1), write_spec("feat", 2), write_test(RED_TEST, 3), done()])
+    state = asyncio.run(run_graph(repo, agent, tmp_path))
+    assert state["status"] == "ready"
+    read_back = tool_results(state, "read_text_file")
+    assert len(read_back) == 1
+    assert "app.delete" not in read_back[0]
+    assert "def add_book" in read_back[0]
+    assert git(["branch", "--show-current"], repo).strip() == "main"
+
+
+def test_dirty_target_is_refused(repo, tmp_path):
+    """With an uncommitted change in the target repository, the run stops before the model is called, and the change is left as it was."""
+    (repo / "app.py").write_text(APP + "\n# uncommitted edit\n")
+    agent = ScriptedAgent([write_spec("feat", 1), write_test(RED_TEST, 2), done()])
+    # The error leaves the graph inside the MCP sessions' task groups, which wrap it in nested exception
+    # groups, so the match has to flatten those to reach the RuntimeError itself.
+    with pytest.RaisesGroup(pytest.RaisesExc(RuntimeError, match="uncommitted changes"), flatten_subgroups=True):
+        asyncio.run(run_graph(repo, agent, tmp_path))
+    assert agent.prompts_seen == []
+    assert "# uncommitted edit" in (repo / "app.py").read_text()
 
 
 def test_invalid_clarification_reason_is_rejected(repo, tmp_path):
