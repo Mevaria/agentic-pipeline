@@ -3,16 +3,19 @@
 Changes code until the given tests pass, or stops as blocked after a fixed
 number of attempts. The graph mixes model steps with code steps:
 
-    prepare  (code)   branch from the base branch and add the given tests
+    prepare  (code)   branch from the base branch, or continue on an existing branch, and add the given tests
     agent    (model)  ReAct loop: reason, call a tool, observe the result
     tools    (code)   execute the tool calls the model asked for
     verify   (code)   run the tests independently and check the tests were not edited
     reflect  (model)  Reflexion: explain the failure, carried into the next attempt
-    finish   (code)   commit with a message the model writes
+    finish   (code)   format the changed files, then commit with a message the model writes
     blocked  (code)   stop once the attempt limit is reached
 
-Branching, test runs used for the decision, and committing are done in code,
-so the model cannot skip them, fake them, or do them at the wrong time.
+Branching, test runs used for the decision, formatting and committing are done
+in code, so the model cannot skip them, fake them, or do them at the wrong time.
+A task may carry "branch" and "review_findings": then the implementer continues
+on that branch to address a reviewer's blocking findings instead of starting
+a new one.
 """
 
 import json
@@ -25,10 +28,12 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES, add_messages
 from langgraph.prebuilt import ToolNode
 
-from pipeline.tooling import call_tool
+from pipeline.tooling import call_tool, latest_tool_results
 
 # Folder inside the target repository that holds the tests; everything in it is protected from the model.
 TESTS_DIR = "tests"
+# Characters of each tool result written to the log, so a run shows what the tools said without flooding it.
+TOOL_LOG_LIMIT = 200
 # Commit types accepted by the Conventional Commits check in finish.
 COMMIT_TYPES = "feat|fix|refactor|test|docs|chore|perf|style|build|ci"
 # "<type>(<optional scope>): <description>" on one line, with the description kept under 72 characters.
@@ -65,6 +70,8 @@ class ImplementerState(TypedDict, total=False):
     commit_message: str
     # Whatever the git server reported back from the commit.
     commit_result: str
+    # What the formatter did in finish: the files it rewrote and any whitespace problem left.
+    format_result: dict
 
 
 def implementer_system_prompt(repo_path):
@@ -88,6 +95,12 @@ def attempt_prompt(task, reflections):
     # The model is told which files must pass, not their contents; it can read them with its tools.
     test_files = ", ".join(task["tests"]) or "none"
     prompt = f"Task:\n{task['spec']}\n\nTests that must pass: {test_files}"
+    # In continue mode the branch already holds an earlier change; the reviewer's findings say what to fix.
+    if task.get("review_findings"):
+        prompt += (
+            "\n\nYour earlier change on this branch was reviewed. Fix these findings without breaking the tests:\n"
+            f"{task['review_findings']}"
+        )
     # Reflexion: lessons from earlier attempts are the only memory that survives between attempts.
     if reflections:
         lessons = "\n".join(f"- Attempt {number}: {text}" for number, text in enumerate(reflections, 1))
@@ -144,25 +157,33 @@ def build_implementer(repo_path, all_tools, agent_tools, model, settings, log=pr
         ]
 
     async def prepare(state):
-        """Code node: check the repo is clean, create the branch, add the given tests and record protected files."""
+        """Code node: check the repo is clean, create or continue the branch, add the given tests and record protected files."""
         task = state["task"]
         status = await git("git_status")
         # Starting on a dirty tree would mix someone else's edits into this run's commit.
         if "working tree clean" not in status:
             raise RuntimeError(f"The target repository has uncommitted changes:\n{status}")
-        await git("git_checkout", branch_name=settings["base_branch"])
-
-        # Branch names follow <type>/<short-description>, as CONVENTIONS.md in the target repository requires.
-        base_name = f"{task['type']}/{task['short_description']}"
         existing = parse_branches(await git("git_branch", branch_type="local"))
-        # git_create_branch reports success even when the branch exists, so pick a free name first:
-        # feat/x, then feat/x-2, feat/x-3 and so on.
-        branch, suffix = base_name, 2
-        while branch in existing:
-            branch, suffix = f"{base_name}-{suffix}", suffix + 1
-        await git("git_create_branch", branch_name=branch, base_branch=settings["base_branch"])
-        await git("git_checkout", branch_name=branch)
-        log(f"[prepare] on branch {branch}")
+
+        if task.get("branch"):
+            # Continue mode: the review gate sends the implementer back to the branch it already built.
+            branch = task["branch"]
+            if branch not in existing:
+                raise RuntimeError(f"Cannot continue on branch {branch}: it does not exist")
+            await git("git_checkout", branch_name=branch)
+            log(f"[prepare] continuing on branch {branch}")
+        else:
+            await git("git_checkout", branch_name=settings["base_branch"])
+            # Branch names follow <type>/<short-description>, as CONVENTIONS.md in the target repository requires.
+            base_name = f"{task['type']}/{task['short_description']}"
+            # git_create_branch reports success even when the branch exists, so pick a free name first:
+            # feat/x, then feat/x-2, feat/x-3 and so on.
+            branch, suffix = base_name, 2
+            while branch in existing:
+                branch, suffix = f"{base_name}-{suffix}", suffix + 1
+            await git("git_create_branch", branch_name=branch, base_branch=settings["base_branch"])
+            await git("git_checkout", branch_name=branch)
+            log(f"[prepare] on branch {branch}")
 
         # The given tests are written before the model starts, so it works against them from the first step.
         for relative_path, content in task["tests"].items():
@@ -185,6 +206,9 @@ def build_implementer(repo_path, all_tools, agent_tools, model, settings, log=pr
 
     async def agent(state):
         """Model node: one ReAct step, producing either tool calls or a final answer."""
+        # What the tools answered since the last step, so a run's log shows refusals and errors, not only call names.
+        for result in latest_tool_results(state["messages"]):
+            log(f"[tool] {result.name} ({result.status}): {str(result.content)[:TOOL_LOG_LIMIT]}")
         response = await model_with_tools.ainvoke(state["messages"])
         # Log the tool names so a run can be followed without printing the whole conversation.
         for tool_call in response.tool_calls:
@@ -261,8 +285,20 @@ def build_implementer(repo_path, all_tools, agent_tools, model, settings, log=pr
         }
 
     async def finish(state):
-        """Code node: have the model write a commit message, validate it, and commit everything on the branch."""
+        """Code node: format the changed files, have the model write a commit message, validate it, and commit."""
         task = state["task"]
+        # The formatter owns layout: trailing whitespace, final newlines, quotes and blank lines are fixed here,
+        # on the changed files outside the tests folder, so no reviewer ever has to police them.
+        format_result = json.loads(await call_tool(tools_by_name, "format_code", {"fix": True}))
+        if format_result.get("reformatted"):
+            log(f"[finish] formatted {format_result['reformatted']}")
+            # Formatting is meant to preserve behaviour; the tests are run again so that is checked, not assumed.
+            recheck = json.loads(await call_tool(tools_by_name, "run_tests", {}))
+            if not recheck["passed"]:
+                log(f"[finish] tests failed after formatting; leaving the branch uncommitted ({recheck.get('summary', '')})")
+                return {"status": "blocked", "format_result": format_result, "test_result": recheck}
+        if format_result.get("error"):
+            log(f"[finish] formatter error, committing unformatted: {format_result['error']}")
         status = await git("git_status")
         # The model writes the message; the code decides whether it is acceptable and does the commit.
         response = await model.ainvoke([
@@ -283,7 +319,7 @@ def build_implementer(repo_path, all_tools, agent_tools, model, settings, log=pr
         await git("git_add", files=["."])
         commit_result = await git("git_commit", message=message)
         log(f"[finish] {commit_result}")
-        return {"status": "passed", "commit_message": message, "commit_result": commit_result}
+        return {"status": "passed", "commit_message": message, "commit_result": commit_result, "format_result": format_result}
 
     async def blocked(state):
         """Code node: record that the attempt limit was reached. Nothing is committed."""

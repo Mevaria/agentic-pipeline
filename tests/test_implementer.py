@@ -172,15 +172,15 @@ def done(messages):
     return AIMessage(content="Added the delete route.")
 
 
-async def run_graph(repo, model, settings=SETTINGS):
+async def run_graph(repo, model, settings=SETTINGS, task=None, log=None):
     """Start the real servers, build the graph with the scripted model, and run the delete-book task."""
     server_config = get_server_config()
     async with AsyncExitStack() as exit_stack:
         all_tools = await open_tools(exit_stack, MultiServerMCPClient(server_config), list(server_config))
         agent_tools = select_tools(all_tools, "implementer")
-        # Logging is silenced so test output stays readable.
-        graph = build_implementer(repo, all_tools, agent_tools, model, settings, log=lambda message: None)
-        return await graph.ainvoke({"task": load_task(TASK_FOLDER)}, {"recursion_limit": recursion_limit(settings)})
+        # Logging is silenced so test output stays readable, unless a test wants to inspect it.
+        graph = build_implementer(repo, all_tools, agent_tools, model, settings, log=log or (lambda message: None))
+        return await graph.ainvoke({"task": task or load_task(TASK_FOLDER)}, {"recursion_limit": recursion_limit(settings)})
 
 
 def test_passes_on_first_attempt_and_commits(repo):
@@ -257,3 +257,47 @@ def test_rerun_uses_a_new_branch_name(repo):
     # The first run commits and leaves the tree clean, so the second run's prepare check passes.
     assert asyncio.run(run_graph(repo, first))["branch"] == "feat/delete-book"
     assert asyncio.run(run_graph(repo, second))["branch"] == "feat/delete-book-2"
+
+
+def test_tool_results_are_logged(repo):
+    """With a passing run, the log receives a [tool] line for each tool result with its status, not only the call names."""
+    lines = []
+    model = ScriptedModel(ScriptedAgent([write_app(repo, APP_MATCHING_SPEC, 1), run_tests_turn(2), done]))
+    asyncio.run(run_graph(repo, model, log=lines.append))
+    assert any(line.startswith("[tool] write_file (success)") for line in lines)
+    assert any(line.startswith("[tool] run_tests (success)") and '"passed": true' in line for line in lines)
+
+
+def test_continue_mode_fixes_on_the_existing_branch(repo):
+    """With a task carrying a branch and review findings, the implementer checks out that branch instead of creating one, puts the findings in its prompt, and commits the fix on top of the earlier commit."""
+    # An earlier run's branch: the route exists but returns 200, as if a reviewer had flagged it.
+    git(["checkout", "-b", "feat/delete-book"], repo)
+    (repo / "app.py").write_text(APP_BREAKING_SPEC)
+    (repo / "tests" / "test_delete_book.py").write_text(load_task(TASK_FOLDER)["tests"]["tests/test_delete_book.py"])
+    git(["add", "."], repo)
+    git(["commit", "-m", "feat: add delete route"], repo)
+    git(["checkout", "main"], repo)
+    findings = "- [scope] app.py:50: the delete route returns 200; the spec requires 204"
+    task = {**load_task(TASK_FOLDER), "branch": "feat/delete-book", "review_findings": findings}
+    agent = ScriptedAgent([write_app(repo, APP_MATCHING_SPEC, 1), done])
+    state = asyncio.run(run_graph(repo, ScriptedModel(agent, commit_message="fix: return 204 on delete"), task=task))
+    assert state["status"] == "passed"
+    assert state["branch"] == "feat/delete-book"
+    assert findings in agent.prompts_seen[0]
+    # Two commits on the branch, the fix on top, and no feat/delete-book-2 was created.
+    assert git(["log", "--format=%s", "main..feat/delete-book"], repo).split() == ["fix:", "return", "204", "on", "delete", "feat:", "add", "delete", "route"]
+    assert "feat/delete-book-2" not in git(["branch"], repo)
+
+
+def test_finish_formats_the_changed_file_before_committing(repo):
+    """With an agent that writes app.py with single quotes and trailing whitespace, finish formats it, the tests still pass, and the committed file is clean while the given test file is untouched."""
+    messy = APP_MATCHING_SPEC.replace('return "", 204', "return '', 204   ")
+    model = ScriptedModel(ScriptedAgent([write_app(repo, messy, 1), done]))
+    state = asyncio.run(run_graph(repo, model))
+    assert state["status"] == "passed"
+    assert state["format_result"]["reformatted"] == ["app.py"]
+    committed = git(["show", "feat/delete-book:app.py"], repo)
+    assert 'return "", 204\n' in committed
+    assert "   \n" not in committed
+    assert git(["status", "--porcelain"], repo).strip() == ""
+    assert (repo / "tests" / "test_delete_book.py").read_text() == load_task(TASK_FOLDER)["tests"]["tests/test_delete_book.py"]

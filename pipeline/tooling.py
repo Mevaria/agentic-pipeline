@@ -4,6 +4,20 @@ Agents call tools through the model. Pipeline code also calls some tools itself,
 at fixed points where no judgement is needed, such as creating a branch.
 """
 
+from langchain_core.messages import AIMessage, ToolMessage
+
+
+def latest_tool_results(messages):
+    """Return the ToolMessages produced for the most recent AIMessage, in order."""
+    results = []
+    # Walk back from the end; the tool results sit after the AIMessage that asked for them.
+    for message in reversed(messages):
+        if isinstance(message, AIMessage):
+            break
+        if isinstance(message, ToolMessage):
+            results.insert(0, message)
+    return results
+
 
 def tool_text(result):
     """Flatten an MCP tool result into plain text.

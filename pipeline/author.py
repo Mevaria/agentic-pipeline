@@ -27,14 +27,14 @@ import shutil
 from pathlib import Path
 from typing import Annotated, Literal, TypedDict
 
-from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage
 from langchain_core.tools import tool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES, add_messages
 from langgraph.prebuilt import ToolNode
 
 from pipeline.tasks import load_task
-from pipeline.tooling import call_tool
+from pipeline.tooling import call_tool, latest_tool_results
 
 # Folder inside the target repository that holds its tests, which the author must read but never write.
 TESTS_DIR = "tests"
@@ -79,18 +79,6 @@ def clarification_request(messages):
                 if call["name"] == "request_clarification" and call["args"].get("reason") in CLARIFICATION_REASONS:
                     return call["args"]["reason"], str(call["args"].get("question", "")).strip()
     return None
-
-
-def latest_tool_results(messages):
-    """Return the ToolMessages produced for the most recent AIMessage, in order."""
-    results = []
-    # Walk back from the end; the tool results sit after the AIMessage that asked for them.
-    for message in reversed(messages):
-        if isinstance(message, AIMessage):
-            break
-        if isinstance(message, ToolMessage):
-            results.insert(0, message)
-    return results
 
 
 def clarification_answered(messages):
