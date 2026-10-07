@@ -53,6 +53,9 @@ SLUG_LIMIT = 50
 TEST_FILE_PATTERN = re.compile(r"^test_[a-z0-9_]+\.py$")
 # Used when the pipeline did not set RUN_ID, so a server started by hand still writes somewhere sensible.
 DEFAULT_RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+# Whitespace rules the formatter pass also applies: trailing whitespace, no newline at end of file,
+# and whitespace on blank lines. ruff format covers the rest of the layout.
+WHITESPACE_RULES = "W291,W292,W293"
 
 # The server itself. Functions decorated with @mcp.tool() are exposed to clients as MCP tools,
 # and FastMCP uses each function's docstring as the tool description the model reads.
@@ -438,6 +441,98 @@ def check_tests_fail(tests: dict[str, str]) -> dict:
         "tests": results,
         "output": tail(stdout + stderr),
     }
+
+
+def changed_python_files(repo_path):
+    """Return (paths, error): Python files the change touched outside the tests folder, relative to the repo.
+
+    Covers files committed on the branch since the base, uncommitted edits and
+    untracked files, the same three views requirements_changed uses. Test files
+    are left out because the implementer protects them and must not alter them.
+    """
+    commands = [
+        ["git", "diff", "--name-only", f"{get_base_branch()}...HEAD"],
+        ["git", "diff", "--name-only", "HEAD"],
+        ["git", "ls-files", "--others", "--exclude-standard"],
+    ]
+    found = set()
+    for args in commands:
+        exit_code, stdout, stderr = run_command(args, repo_path)
+        if exit_code != 0:
+            return [], f"Could not list changed files: {tail(stderr, 300).strip()}"
+        found.update(line.strip() for line in stdout.splitlines() if line.strip())
+    paths = sorted(
+        path for path in found
+        # Only Python files that still exist; a deleted file has nothing to format.
+        if path.endswith(".py") and (repo_path / path).is_file()
+        and not path.replace("\\", "/").startswith(f"{TESTS_DIR}/")
+    )
+    return paths, None
+
+
+def unformatted_files(check_output):
+    """Return the paths ruff format --check says it would rewrite, from either of its output styles."""
+    found = set()
+    for line in check_output.splitlines():
+        stripped = line.strip()
+        # ruff 0.16 prints a diagnostic per file with the location on an arrow line: " --> path:row:col".
+        if stripped.startswith("--> "):
+            found.add(stripped[4:].rsplit(":", 2)[0].replace("\\", "/"))
+        # Earlier versions print one "Would reformat: path" line per file.
+        elif stripped.startswith("Would reformat:"):
+            found.add(stripped.split(":", 1)[1].strip().replace("\\", "/"))
+    return found
+
+
+@mcp.tool()
+def format_code(fix: bool = False) -> dict:
+    """Format the Python files the change touched, or report what formatting would change.
+
+    Runs ruff format and ruff's whitespace rules on the changed files outside
+    the tests folder. With fix=True the files are rewritten and the ones that
+    changed are listed under "reformatted"; with fix=False nothing is written
+    and the files that would change are listed under "would_reformat". Either
+    way "findings" lists whitespace problems that remain, as file, line, code
+    and message.
+    """
+    repo_path = get_repo_path()
+    files, error = changed_python_files(repo_path)
+    if error:
+        return {"files": [], "reformatted": [], "would_reformat": [], "findings": [], "error": error}
+    if not files:
+        return {"files": [], "reformatted": [], "would_reformat": [], "findings": [], "error": None}
+    # Contents are snapshotted so the rewritten files can be identified by comparison, whatever ruff prints.
+    before = {path: (repo_path / path).read_bytes() for path in files}
+    ruff = [sys.executable, "-m", "ruff"]
+    # --check only reports; without it ruff format rewrites in place.
+    format_args = [*ruff, "format", *([] if fix else ["--check"]), *files]
+    exit_code, stdout, stderr = run_command(format_args, repo_path)
+    # ruff format exits 2 on an internal error, such as a file it cannot parse; 1 only means "would reformat".
+    if exit_code not in (0, 1):
+        return {"files": files, "reformatted": [], "would_reformat": [], "findings": [],
+                "error": f"ruff format failed: {tail(stdout + stderr, 300).strip()}"}
+    would_reformat = [] if fix else sorted(unformatted_files(stdout))
+    # The whitespace rules run after formatting; with --fix the fixable ones are applied and only the rest are printed.
+    check_args = [*ruff, "check", "--select", WHITESPACE_RULES, "--output-format", "json", *(["--fix"] if fix else []), *files]
+    exit_code, stdout, stderr = run_command(check_args, repo_path)
+    try:
+        report = json.loads(stdout) if stdout.strip() else []
+    except ValueError:
+        return {"files": files, "reformatted": [], "would_reformat": would_reformat, "findings": [],
+                "error": f"ruff check output could not be parsed: {tail(stdout + stderr, 300).strip()}"}
+    findings = [
+        {
+            # ruff reports absolute paths; they are made relative so they match the diff.
+            "file": Path(item.get("filename", "")).resolve().relative_to(repo_path).as_posix()
+            if item.get("filename") else "",
+            "line": (item.get("location") or {}).get("row"),
+            "code": item.get("code"),
+            "message": item.get("message"),
+        }
+        for item in report
+    ]
+    reformatted = [path for path in files if fix and (repo_path / path).read_bytes() != before[path]]
+    return {"files": files, "reformatted": reformatted, "would_reformat": would_reformat, "findings": findings, "error": None}
 
 
 @mcp.tool()

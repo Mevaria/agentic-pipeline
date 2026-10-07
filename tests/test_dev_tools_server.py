@@ -382,6 +382,50 @@ def test_write_task_test_rejects_bad_names_and_empty_content(tmp_path):
     assert not (tmp_path / "tasks" / "run-1").exists()
 
 
+def test_format_code_leaves_a_formatted_change_alone(repo):
+    """format_code with fix=True on a changed file that is already formatted rewrites nothing and reports no findings."""
+    (repo / "app.py").write_text(APP_CODE.replace("    return app\n", "    # a formatted comment\n    return app\n"))
+    result = server.format_code(fix=True)
+    assert result["files"] == ["app.py"]
+    assert result["reformatted"] == []
+    assert result["findings"] == []
+
+
+def test_format_code_formats_only_changed_files(repo):
+    """format_code with fix=True rewrites a changed file with bad formatting and leaves an unformatted file the change did not touch exactly as it was."""
+    # An unformatted file already on main, which the change does not touch.
+    untouched = "x = 'a'   \n"
+    (repo / "helpers.py").write_text(untouched)
+    git(["add", "helpers.py"], repo)
+    git(["commit", "-m", "chore: add helper"], repo)
+    (repo / "app.py").write_text(APP_CODE.replace('return "ok"', "return 'ok'   "))
+    result = server.format_code(fix=True)
+    assert result["files"] == ["app.py"]
+    assert result["reformatted"] == ["app.py"]
+    assert 'return "ok"\n' in (repo / "app.py").read_text()
+    assert (repo / "helpers.py").read_text() == untouched
+
+
+def test_format_code_reports_without_fixing(repo):
+    """format_code with fix=False names the changed file it would rewrite and its whitespace findings, and leaves the file unchanged."""
+    messy = APP_CODE.replace('return "ok"', 'return "ok"   ')
+    (repo / "app.py").write_text(messy)
+    result = server.format_code(fix=False)
+    assert result["would_reformat"] == ["app.py"]
+    assert [finding["code"] for finding in result["findings"]] == ["W291"]
+    assert result["findings"][0]["file"] == "app.py"
+    assert (repo / "app.py").read_text() == messy
+
+
+def test_format_code_skips_test_files(repo):
+    """format_code with fix=True ignores a changed file inside the tests folder, so protected tests are never rewritten."""
+    messy = TEST_CODE.replace('b"ok"', 'b"ok"   ')
+    (repo / "tests" / "test_app.py").write_text(messy)
+    result = server.format_code(fix=True)
+    assert result["files"] == []
+    assert (repo / "tests" / "test_app.py").read_text() == messy
+
+
 @pytest.mark.usefixtures("repo")
 def test_task_folder_is_what_the_implementer_loads():
     """After write_task_spec and write_task_test, load_task on the reported folder returns the task with its tests keyed by repository path."""
