@@ -134,6 +134,8 @@ class ScriptedModel:
         self.commit_message = commit_message
         # Counts reflection requests, so a test can check Reflexion ran exactly when expected.
         self.reflections_asked = 0
+        # The human message of every plain call, so a test can check what the commit-message prompt said.
+        self.plain_prompts = []
 
     def bind_tools(self, tools):
         """Return the scripted agent as the tool-using model, ignoring the tools themselves."""
@@ -141,6 +143,7 @@ class ScriptedModel:
 
     async def ainvoke(self, messages):
         """Answer the plain-model calls: a fixed reflection, or the commit message for anything else."""
+        self.plain_prompts.append(messages[1].content)
         # The reflect node's system prompt starts with "You review a failed attempt", which identifies it.
         if "review a failed attempt" in messages[0].content:
             self.reflections_asked += 1
@@ -280,13 +283,28 @@ def test_continue_mode_fixes_on_the_existing_branch(repo):
     findings = "- [scope] app.py:50: the delete route returns 200; the spec requires 204"
     task = {**load_task(TASK_FOLDER), "branch": "feat/delete-book", "review_findings": findings}
     agent = ScriptedAgent([write_app(repo, APP_MATCHING_SPEC, 1), done])
-    state = asyncio.run(run_graph(repo, ScriptedModel(agent, commit_message="fix: return 204 on delete"), task=task))
+    model = ScriptedModel(agent, commit_message="fix: return 204 on delete")
+    state = asyncio.run(run_graph(repo, model, task=task))
     assert state["status"] == "passed"
     assert state["branch"] == "feat/delete-book"
     assert findings in agent.prompts_seen[0]
+    # The commit-message prompt asks for a message about the revision, with the findings, not the original feature.
+    assert "revises an earlier change" in model.plain_prompts[-1] and findings in model.plain_prompts[-1]
     # Two commits on the branch, the fix on top, and no feat/delete-book-2 was created.
     assert git(["log", "--format=%s", "main..feat/delete-book"], repo).split() == ["fix:", "return", "204", "on", "delete", "feat:", "add", "delete", "route"]
     assert "feat/delete-book-2" not in git(["branch"], repo)
+
+
+def test_invalid_commit_message_in_continue_mode_falls_back_to_a_revision_message(repo):
+    """With a task carrying review findings and a model whose commit message is invalid, the fallback names the revision."""
+    git(["checkout", "-b", "feat/delete-book"], repo)
+    (repo / "app.py").write_text(APP_BREAKING_SPEC)
+    git(["commit", "-am", "feat: add delete route"], repo)
+    git(["checkout", "main"], repo)
+    task = {**load_task(TASK_FOLDER), "branch": "feat/delete-book", "review_findings": "- [scope] app.py: returns 200"}
+    model = ScriptedModel(ScriptedAgent([write_app(repo, APP_MATCHING_SPEC, 1), done]), commit_message="Fixed it.")
+    asyncio.run(run_graph(repo, model, task=task))
+    assert git(["log", "-1", "--format=%s"], repo).strip() == "feat: revise delete book"
 
 
 def test_finish_formats_the_changed_file_before_committing(repo):
