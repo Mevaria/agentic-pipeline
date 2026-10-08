@@ -92,7 +92,17 @@ def get_review_settings():
         "max_review_rounds": get_int("MAX_REVIEW_ROUNDS", 2),
         # Model turns the reviewer gets to produce its verdict before the gate fails closed.
         "max_tool_steps": get_int("MAX_TOOL_STEPS", 12),
+        # Whether a second, security-only model call runs after the review over the same evidence.
+        "security_pass": get_flag("SECURITY_PASS", False),
     }
+
+
+def get_flag(name, default):
+    """Return the environment variable `name` as a boolean: 1, true, yes and on count as True."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def get_tasks_path():

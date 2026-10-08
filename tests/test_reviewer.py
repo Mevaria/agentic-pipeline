@@ -142,11 +142,13 @@ class ScriptedAgent:
     def __init__(self, turns):
         """Store the turns, each a function from messages to an AIMessage, to be played in order."""
         self.turns = list(turns)
-        # The evidence prompt from every call, so tests can check what the reviewer was shown.
+        # The system and evidence prompts from every call, so tests can check what the reviewer was shown.
+        self.system_prompts_seen = []
         self.prompts_seen = []
 
     async def ainvoke(self, messages):
-        """Record the evidence prompt and play the next scripted turn."""
+        """Record the system and evidence prompts and play the next scripted turn."""
+        self.system_prompts_seen.append(messages[0].content)
         self.prompts_seen.append(messages[1].content)
         return self.turns.pop(0)(messages)
 
@@ -272,6 +274,62 @@ def test_blocking_finding_outside_the_diff_is_downgraded(repo, tmp_path):
     assert result["approved"] is True
     assert result["blocking_findings"] == []
     assert "downgraded" in result["non_blocking_findings"][0]["message"]
+
+
+def test_line_numbers_outside_the_change_are_dropped(repo, tmp_path):
+    """With findings whose lines fall inside the added lines, on an unchanged line, and far past the file, the verdict keeps the first line and drops the other two, so the pull request never shows a misleading one."""
+    build_branch(repo, APP_MATCHING_SPEC)
+    findings = [
+        {**scope_finding(severity="non_blocking"), "line": 20, "message": "inside the added route"},
+        {**scope_finding(severity="non_blocking"), "line": 3, "message": "an unchanged import line"},
+        {**scope_finding(severity="non_blocking"), "line": 999, "message": "past the end of the file"},
+    ]
+    agent = ScriptedAgent([submit(findings, "Three nits.", 1)])
+    result = asyncio.run(run_review(repo, agent, tmp_path))
+    lines = {finding["message"]: finding["line"] for finding in result["non_blocking_findings"] if finding["source"] == "model"}
+    assert lines == {"inside the added route": 20, "an unchanged import line": None, "past the end of the file": None}
+
+
+def test_security_pass_runs_as_a_second_call_and_its_findings_count(repo, tmp_path):
+    """With security_pass enabled, the model is called twice over the same evidence, the second time with only the route questions, and an information_exposure finding from that pass blocks the verdict."""
+    build_branch(repo, APP_MATCHING_SPEC)
+    exposure = {"item": "information_exposure", "severity": "blocking", "file": "app.py", "line": 20,
+                "message": "the response includes internal data"}
+    agent = ScriptedAgent([submit([], "Clean on scope.", 1), submit([exposure], "One exposure.", 2)])
+    settings = {**REVIEW_SETTINGS, "security_pass": True}
+    result = asyncio.run(run_review(repo, agent, tmp_path, settings))
+    assert result["approved"] is False
+    assert [(finding["source"], finding["item"]) for finding in result["blocking_findings"]] == [("security", "information_exposure")]
+    assert result["summary"] == "Clean on scope. Security pass: One exposure."
+    # Two passes, two evidence prompts; the review pass's system prompt carried the questions too, so both see them.
+    assert len(agent.prompts_seen) == 2
+    assert len(agent.turns) == 0
+
+
+def test_checklist_comes_from_the_base_branch(repo, tmp_path):
+    """With a branch that rewrites CONVENTIONS.md to drop the scope rule, the reviewer is still given the base branch's checklist, scope rule included, and CONVENTIONS.md shows in the diff as a changed file."""
+    build_branch(repo, APP_MATCHING_SPEC)
+    git(["checkout", BRANCH], repo)
+    (repo / "CONVENTIONS.md").write_text(CONVENTIONS.replace("- The change stays within the scope of the request.\n", ""))
+    git(["commit", "-am", "docs: drop the scope rule"], repo)
+    git(["checkout", "main"], repo)
+    agent = ScriptedAgent([submit([], "Clean.", 1)])
+    asyncio.run(run_review(repo, agent, tmp_path))
+    assert "The change stays within the scope of the request." in agent.system_prompts_seen[0]
+    assert "Full content of CONVENTIONS.md" in agent.prompts_seen[0]
+
+
+def test_later_commits_on_main_do_not_appear_in_the_diff(repo, tmp_path):
+    """With a file committed to main after the branch was created, the reviewer's diff and changed files contain only the branch's own change."""
+    build_branch(repo, APP_MATCHING_SPEC)
+    (repo / "NOTES.md").write_text("added to main later\n")
+    git(["add", "NOTES.md"], repo)
+    git(["commit", "-m", "docs: notes"], repo)
+    agent = ScriptedAgent([submit([], "Clean.", 1)])
+    result = asyncio.run(run_review(repo, agent, tmp_path))
+    assert "NOTES.md" not in result["diff"]
+    assert "NOTES.md" not in agent.prompts_seen[0]
+    assert "def delete_book" in result["diff"]
 
 
 def test_no_verdict_fails_closed(repo, tmp_path):
