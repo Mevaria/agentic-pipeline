@@ -382,6 +382,38 @@ def test_write_task_test_rejects_bad_names_and_empty_content(tmp_path):
     assert not (tmp_path / "tasks" / "run-1").exists()
 
 
+def test_diff_against_base_ignores_later_commits_on_main(repo):
+    """diff_against_base from a branch shows the branch's own change and not a file committed to main after the branch was created."""
+    git(["checkout", "-b", "feat/change"], repo)
+    (repo / "app.py").write_text(APP_CODE.replace('"ok"', '"changed"'))
+    git(["commit", "-am", "feat: change the reply"], repo)
+    # A later commit on main, which a plain diff against main's tip would show as a deletion.
+    git(["checkout", "main"], repo)
+    (repo / "NOTES.md").write_text("later\n")
+    git(["add", "NOTES.md"], repo)
+    git(["commit", "-m", "docs: notes"], repo)
+    git(["checkout", "feat/change"], repo)
+    result = server.diff_against_base()
+    assert result["error"] is None
+    assert '+        return "changed"' in result["diff"]
+    assert "NOTES.md" not in result["diff"]
+
+
+def test_read_file_on_base_ignores_the_branch_edit(repo):
+    """read_file_on_base returns a file as it is on main even when the checked-out branch has rewritten it, and reports an error for a file main does not have."""
+    (repo / "RULES.md").write_text("- rule one\n")
+    git(["add", "RULES.md"], repo)
+    git(["commit", "-m", "docs: rules"], repo)
+    git(["checkout", "-b", "feat/rewrite-rules"], repo)
+    (repo / "RULES.md").write_text("- no rules\n")
+    git(["commit", "-am", "docs: remove the rules"], repo)
+    assert server.read_file_on_base("RULES.md") == {"content": "- rule one\n", "error": None}
+    missing = server.read_file_on_base("MISSING.md")
+    assert missing["content"] is None and "MISSING.md" in missing["error"]
+    with pytest.raises(ValueError):
+        server.read_file_on_base("../outside.md")
+
+
 def test_format_code_leaves_a_formatted_change_alone(repo):
     """format_code with fix=True on a changed file that is already formatted rewrites nothing and reports no findings."""
     (repo / "app.py").write_text(APP_CODE.replace("    return app\n", "    # a formatted comment\n    return app\n"))

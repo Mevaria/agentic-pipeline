@@ -327,6 +327,43 @@ def run_security_scan() -> dict:
     }
 
 
+@mcp.tool()
+def diff_against_base() -> dict:
+    """Return the checked-out branch's change as a unified diff against its merge base with BASE_BRANCH.
+
+    The three-dot form means commits added to the base branch after this branch
+    was created are not shown as if the branch had removed them. Returns
+    {"diff": text, "error": None}, or an error when git cannot compare.
+    """
+    repo_path = get_repo_path()
+    base_branch = get_base_branch()
+    exit_code, stdout, stderr = run_command(["git", "diff", "--unified=3", f"{base_branch}...HEAD"], repo_path)
+    if exit_code != 0:
+        return {"diff": "", "error": f"Could not diff against '{base_branch}': {tail(stderr, 300).strip()}"}
+    return {"diff": stdout, "error": None}
+
+
+@mcp.tool()
+def read_file_on_base(path: str) -> dict:
+    """Return a file's content as it is on BASE_BRANCH, ignoring any edit the checked-out branch made to it.
+
+    Used for files that govern how a change is judged, such as the review
+    checklist, so a branch cannot rewrite the rules it is reviewed by. Returns
+    {"content": text, "error": None}, or content None with an error when the
+    file does not exist on the base branch.
+    """
+    repo_path = get_repo_path()
+    base_branch = get_base_branch()
+    # The same containment check as run_tests, so "../" cannot reach outside the repository.
+    resolve_inside_repo(repo_path, path)
+    # git show takes "ref:path" with forward slashes, relative to the repository root.
+    spec = f"{base_branch}:{path.replace(os.sep, '/').lstrip('./')}"
+    exit_code, stdout, stderr = run_command(["git", "show", spec], repo_path)
+    if exit_code != 0:
+        return {"content": None, "error": f"Could not read {spec}: {tail(stderr, 300).strip()}"}
+    return {"content": stdout, "error": None}
+
+
 def remove_worktree(repo_path, worktree):
     """Remove a worktree folder and its registration in the repository, whether or not git still recognises it."""
     if worktree.exists():
