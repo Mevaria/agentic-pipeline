@@ -23,7 +23,7 @@ load_dotenv(PROJECT_ROOT / ".env")
 FILESYSTEM_SERVER_PACKAGE = "@modelcontextprotocol/server-filesystem"
 # The only GitHub tools the server is started with. Given alone, GITHUB_TOOLS makes the server expose exactly
 # these (verified live against v2.0.2), so merge_pull_request is never offered to anything.
-GITHUB_TOOLS_ALLOWED = ["create_pull_request", "list_pull_requests", "pull_request_read"]
+GITHUB_TOOLS_ALLOWED = ["create_pull_request", "list_pull_requests", "pull_request_read", "add_issue_comment"]
 
 
 def get_target_repo_path():
@@ -119,6 +119,14 @@ def get_reporter_settings():
         "repository": os.environ.get("GITHUB_REPOSITORY", ""),
         # Branches the cleanup fallback may never delete; the same list the dev tools server reads.
         "protected_branches": {name.strip() for name in os.environ.get("PROTECTED_BRANCHES", "main,master").split(",") if name.strip()},
+    }
+
+
+def get_feedback_settings():
+    """Return the feedback loop's settings: revisions allowed per pull request."""
+    return {
+        # /revise comments acted on per pull request before the loop stops as blocked.
+        "max_revisions": get_int("MAX_PR_REVISIONS", 2),
     }
 
 

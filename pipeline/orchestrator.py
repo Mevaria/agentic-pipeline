@@ -34,6 +34,8 @@ from pipeline.tooling import call_tool, innermost_error, scrub_secrets
 
 # File name of the patch that keeps a blocked or crashed attempt's uncommitted changes, in the run's task folder.
 PATCH_NAME = "uncommitted.patch"
+# Hidden marker in every note the pipeline posts on a pull request, so the feedback loop can recognise its own notes.
+PIPELINE_NOTE_MARKER = "<!-- agentic-pipeline note -->"
 # Outcomes the orchestrator itself records, in addition to the reporter's.
 NEEDS_CLARIFICATION, BLOCKED, CRASHED = "needs_clarification", "blocked", "crashed"
 
@@ -75,7 +77,39 @@ def restore_directly(repo_path, base_branch, branch, log, protected_branches=fro
     return {"restored": True, "via": "fallback", "branch": branch, "branch_deleted": branch_deleted, "error": None}
 
 
-async def run_pipeline(repo_path, all_tools, agent_tools, models, request, run_id, task_folder, settings, log=print):
+def revision_request(request, previous_task, feedback):
+    """Return the author's request for a revision: the original request, what was written before, and the owner's feedback."""
+    text = f"{request}\n\nThis is a revision of an earlier change that is already on a pull request.\n"
+    if previous_task:
+        text += f"\nThe spec written before (type {previous_task['type']}, {previous_task['short_description']}):\n{previous_task['spec']}\n"
+        for path, content in previous_task.get("tests", {}).items():
+            text += f"\nThe test file written before, {Path(path).name}; keep this file name:\n{content}\n"
+    # The feedback is quoted as data: it says what the owner wants changed, nothing about how to use the tools.
+    text += (
+        "\nThe repository owner reviewed the pull request and asked for these changes. Revise the spec and the "
+        "tests so they describe the change as the owner wants it; keep the same type and short description, "
+        "and the same test file names.\n"
+        f"--- owner feedback, quoted ---\n{feedback}\n--- end of owner feedback ---"
+    )
+    return text
+
+
+def pipeline_note(revision_number, max_revisions, record):
+    """Return the note posted on the pull request after a revision, marked so the loop never mistakes it for feedback."""
+    implementer = record["stages"].get("implementer", {})
+    gate = record["stages"].get("gate", {})
+    summary = gate["rounds"][-1]["summary"] if gate.get("rounds") else ""
+    tests = ", ".join(f"`{path}`" for path in record.get("test_files", [])) or "unchanged"
+    return (
+        f"**Automated note from the agentic pipeline.** {PIPELINE_NOTE_MARKER}\n\n"
+        f"Revision {revision_number} of {max_revisions}, in response to the `/revise` comment.\n\n"
+        f"- Commit: {implementer.get('commit_message', '')}\n"
+        f"- Tests revised: {tests}\n"
+        f"- Review: {summary or 'no summary'}\n"
+    )
+
+
+async def run_pipeline(repo_path, all_tools, agent_tools, models, request, run_id, task_folder, settings, log=print, revision=None):
     """Run every stage on one request and return the run record.
 
     all_tools: every MCP tool, for the stages' code steps.
@@ -83,6 +117,9 @@ async def run_pipeline(repo_path, all_tools, agent_tools, models, request, run_i
     models: {"author", "implementer", "reviewer", "reporter"}, chat models per stage (usually the same one).
     settings: {"author", "implementer", "review", "reporter"}, each stage's settings.
     task_folder: where the author writes, TASKS_PATH/run_id; the patch of a failed attempt goes there too.
+    revision: None for a fresh run, or {"branch", "pull_request", "feedback", "previous_task", "number", "max"}
+        to revise an existing pull request: the author gets the feedback, the implementer continues on the
+        branch, the reporter reuses the pull request, and a note is posted on it afterwards.
     """
     repo = str(Path(repo_path))
     task_folder = Path(task_folder)
@@ -154,9 +191,11 @@ async def run_pipeline(repo_path, all_tools, agent_tools, models, request, run_i
         record["stages"]["preflight"] = {"clean": True, "base_branch": base_branch}
 
         stage = "author"
-        log(f"[pipeline] author on run {run_id}")
+        log(f"[pipeline] author on run {run_id}" + (f", revising pull request #{revision['pull_request']}" if revision else ""))
         author_graph = build_author(repo, all_tools, agent_tools["author"], models["author"], settings["author"], task_folder, log)
-        state = await author_graph.ainvoke({"request": request}, {"recursion_limit": author_recursion_limit(settings["author"])})
+        # In a revision the author sees the earlier spec and tests and the owner's feedback, not only the request.
+        author_input = revision_request(request, revision["previous_task"], revision["feedback"]) if revision else request
+        state = await author_graph.ainvoke({"request": author_input}, {"recursion_limit": author_recursion_limit(settings["author"])})
         record["stages"]["author"] = {
             "status": state["status"], "revisions": state.get("revision", 0), "feedback": state.get("feedback", []),
             "question": state.get("question"), "reason": state.get("clarification_reason"),
@@ -170,6 +209,11 @@ async def run_pipeline(repo_path, all_tools, agent_tools, models, request, run_i
             await notify(BLOCKED, f"The author could not produce failing tests for the request ({state['status']}).")
             return record
         task = {**load_task(task_folder), "request": request}
+        record["test_files"] = list(task["tests"])
+        if revision:
+            # Continue on the pull request's branch, with the owner's feedback in the implementer's prompt.
+            task["branch"] = revision["branch"]
+            task["review_findings"] = f"The repository owner asked for these changes:\n{revision['feedback']}"
 
         stage = "implementer"
         log(f"[pipeline] implementer on {task['type']}/{task['short_description']}")
@@ -201,6 +245,19 @@ async def run_pipeline(repo_path, all_tools, agent_tools, models, request, run_i
         reporter_record = await report(repo, all_tools, models["reporter"], task, branch, gate["review"], run_id, settings["reporter"], log)
         record["stages"]["reporter"] = reporter_record
         record["outcome"] = reporter_record["outcome"]
+        if revision and reporter_record["outcome"] == "ready_to_review":
+            # The note posts under the owner's token, so it says what it is and carries a marker the loop checks.
+            stage = "note"
+            owner, repo_name = reporter_record["repository"].split("/", 1)
+            body = pipeline_note(revision["number"], revision["max"], record)
+            try:
+                await call_tool(tools_by_name, "add_issue_comment", {"owner": owner, "repo": repo_name,
+                                                                     "issue_number": revision["pull_request"], "body": body})
+                record["note"] = {"posted": True, "body": body}
+                log(f"[pipeline] posted the revision note on pull request #{revision['pull_request']}")
+            except Exception as error:
+                record["note"] = {"posted": False, "body": body, "error": scrub_secrets(innermost_error(error))[:300]}
+                log(f"[pipeline] could not post the revision note: {record['note']['error']}")
         return record
     except BaseException as error:
         # Whatever escaped a stage is reduced to one line; the full traceback is not what the developer needs.
