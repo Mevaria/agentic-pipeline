@@ -4,7 +4,24 @@ Agents call tools through the model. Pipeline code also calls some tools itself,
 at fixed points where no judgement is needed, such as creating a branch.
 """
 
+import os
+import re
+
 from langchain_core.messages import AIMessage, ToolMessage
+
+# Environment variables whose values must never appear in a log or a record.
+SECRET_NAME_PATTERN = re.compile(r"TOKEN|SECRET|PASSWORD|API_KEY", re.I)
+# Shorter values are not treated as secrets, so a variable like "1" cannot blank out every "1" in a log.
+SECRET_MIN_LENGTH = 8
+
+
+def scrub_secrets(text):
+    """Return text with the value of every secret-looking environment variable replaced by <redacted>."""
+    scrubbed = str(text)
+    for name, value in os.environ.items():
+        if SECRET_NAME_PATTERN.search(name) and len(value) >= SECRET_MIN_LENGTH and value in scrubbed:
+            scrubbed = scrubbed.replace(value, "<redacted>")
+    return scrubbed
 
 
 def latest_tool_results(messages):

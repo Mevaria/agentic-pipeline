@@ -33,7 +33,7 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES, add_messages
 from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel, Field
 
-from pipeline.tooling import call_tool, latest_tool_results
+from pipeline.tooling import call_tool, latest_tool_results, scrub_secrets
 
 # The checklist items the model judges. The other two items, tests and scan severity, are decided by code.
 JUDGED_ITEMS = ("input_validation", "secrets", "information_exposure", "scope")
@@ -360,7 +360,7 @@ def build_reviewer(repo_path, all_tools, model, settings, log=print):
     async def reviewer(state):
         """Model node: one turn, which should end in a submit_review call."""
         for result in latest_tool_results(state["messages"]):
-            log(f"[tool] {result.name} ({result.status}): {str(result.content)[:TOOL_LOG_LIMIT]}")
+            log(f"[tool] {result.name} ({result.status}): {scrub_secrets(result.content)[:TOOL_LOG_LIMIT]}")
         response = await model_with_tools.ainvoke(state["messages"])
         for tool_call in response.tool_calls:
             log(f"[{state['pass_name']}] {tool_call['name']}")

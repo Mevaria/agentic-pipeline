@@ -28,7 +28,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES, add_messages
 from langgraph.prebuilt import ToolNode
 
-from pipeline.tooling import call_tool, latest_tool_results
+from pipeline.tooling import call_tool, latest_tool_results, scrub_secrets
 
 # Folder inside the target repository that holds the tests; everything in it is protected from the model.
 TESTS_DIR = "tests"
@@ -208,7 +208,7 @@ def build_implementer(repo_path, all_tools, agent_tools, model, settings, log=pr
         """Model node: one ReAct step, producing either tool calls or a final answer."""
         # What the tools answered since the last step, so a run's log shows refusals and errors, not only call names.
         for result in latest_tool_results(state["messages"]):
-            log(f"[tool] {result.name} ({result.status}): {str(result.content)[:TOOL_LOG_LIMIT]}")
+            log(f"[tool] {result.name} ({result.status}): {scrub_secrets(result.content)[:TOOL_LOG_LIMIT]}")
         response = await model_with_tools.ainvoke(state["messages"])
         # Log the tool names so a run can be followed without printing the whole conversation.
         for tool_call in response.tool_calls:
