@@ -382,6 +382,96 @@ def test_write_task_test_rejects_bad_names_and_empty_content(tmp_path):
     assert not (tmp_path / "tasks" / "run-1").exists()
 
 
+def test_uncommitted_patch_includes_edits_and_new_files(repo):
+    """uncommitted_patch returns a patch covering an edited tracked file and an untracked new file, names both, and leaves the index unstaged."""
+    (repo / "app.py").write_text(APP_CODE.replace('"ok"', '"changed"'))
+    (repo / "extra.py").write_text("VALUE = 1\n")
+    result = server.uncommitted_patch()
+    assert result["error"] is None
+    assert sorted(result["files"]) == ["app.py", "extra.py"]
+    assert '+        return "changed"' in result["patch"] and "+VALUE = 1" in result["patch"]
+    # Nothing is left staged, so the caller's later restore or commit sees the tree as it was.
+    assert git(["diff", "--cached", "--name-only"], repo).strip() == ""
+
+
+def test_restore_repository_refuses_any_other_path(repo, tmp_path):
+    """restore_repository with a path that is not the configured target repository refuses and changes nothing there."""
+    other = tmp_path / "other"
+    other.mkdir()
+    git(["init", "-b", "main"], other)
+    (other / "keep.txt").write_text("untouched\n")
+    result = server.restore_repository(str(other))
+    assert result["restored"] is False
+    assert "Refused" in result["error"]
+    assert (other / "keep.txt").read_text() == "untouched\n"
+
+
+def test_restore_repository_discards_changes_and_deletes_an_empty_branch(repo):
+    """restore_repository on a feature branch with no commits, an edited file and an untracked file returns to main with a clean tree and deletes the branch."""
+    git(["checkout", "-b", "feat/empty"], repo)
+    (repo / "app.py").write_text(APP_CODE.replace('"ok"', '"broken"'))
+    (repo / "tests" / "test_new.py").write_text("def test_x():\n    assert True\n")
+    result = server.restore_repository(str(repo), "feat/empty")
+    assert result["restored"] is True
+    assert sorted(result["discarded"]) == ["app.py", "tests/test_new.py"]
+    assert result["branch_deleted"] is True
+    assert git(["branch", "--show-current"], repo).strip() == "main"
+    assert git(["status", "--porcelain"], repo).strip() == ""
+    assert (repo / "app.py").read_text() == APP_CODE
+    assert "feat/empty" not in git(["branch"], repo)
+
+
+def test_restore_repository_uses_the_checked_out_branch_when_none_is_given(repo):
+    """restore_repository with no branch name, called while an empty feature branch is checked out, treats that branch as the run's and deletes it."""
+    git(["checkout", "-b", "feat/left-checked-out"], repo)
+    (repo / "app.py").write_text(APP_CODE.replace('"ok"', '"half done"'))
+    result = server.restore_repository(str(repo))
+    assert result["restored"] is True
+    assert result["branch"] == "feat/left-checked-out" and result["branch_deleted"] is True
+    assert "feat/left-checked-out" not in git(["branch"], repo)
+    assert git(["branch", "--show-current"], repo).strip() == "main"
+
+
+def test_restore_repository_after_a_crash_on_main_never_deletes_main(repo):
+    """restore_repository with no branch name while main is checked out with uncommitted changes discards them, stays on main, and deletes nothing."""
+    (repo / "app.py").write_text(APP_CODE.replace('"ok"', '"half done"'))
+    (repo / "stray.py").write_text("x = 1\n")
+    result = server.restore_repository(str(repo))
+    assert result["restored"] is True
+    assert result["branch"] == "" and result["branch_deleted"] is False
+    assert git(["branch", "--show-current"], repo).strip() == "main"
+    assert git(["status", "--porcelain"], repo).strip() == ""
+    assert (repo / "app.py").read_text() == APP_CODE
+
+
+def test_restore_repository_never_deletes_the_base_or_a_protected_branch(repo, monkeypatch):
+    """restore_repository asked to delete main, or a protected branch with no commits beyond main, keeps both."""
+    monkeypatch.setenv("PROTECTED_BRANCHES", "main,master,release")
+    git(["branch", "release"], repo)
+    assert server.restore_repository(str(repo), "main")["branch_deleted"] is False
+    assert server.restore_repository(str(repo), "release")["branch_deleted"] is False
+    assert "release" in git(["branch"], repo) and "main" in git(["branch"], repo)
+
+
+def test_restore_repository_keeps_a_branch_with_commits(repo):
+    """restore_repository on a feature branch that has a commit returns to main but keeps the branch, since it holds real work."""
+    git(["checkout", "-b", "feat/kept"], repo)
+    (repo / "app.py").write_text(APP_CODE.replace('"ok"', '"kept"'))
+    git(["commit", "-am", "feat: keep"], repo)
+    (repo / "scratch.txt").write_text("leftover\n")
+    result = server.restore_repository(str(repo), "feat/kept")
+    assert result["restored"] is True and result["branch_deleted"] is False
+    assert git(["branch", "--show-current"], repo).strip() == "main"
+    assert not (repo / "scratch.txt").exists()
+    assert "feat/kept" in git(["branch"], repo)
+
+
+def test_notify_user_accepts_needs_clarification(repo):
+    """notify_user with the needs_clarification outcome writes a NEEDS CLARIFICATION line carrying the question."""
+    result = server.notify_user("needs_clarification", "Which field is required?")
+    assert "NEEDS CLARIFICATION: Which field is required?" in Path(result["log"]).read_text()
+
+
 def test_parse_github_remote_reads_https_and_ssh_forms():
     """parse_github_remote returns owner and repo for https and ssh GitHub URLs, with or without .git, and None for anything else."""
     assert server.parse_github_remote("https://github.com/Mevaria/reading-list.git") == ("Mevaria", "reading-list")

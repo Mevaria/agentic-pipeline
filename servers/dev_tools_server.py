@@ -667,15 +667,82 @@ def git_push() -> dict:
 
 
 @mcp.tool()
+def uncommitted_patch() -> dict:
+    """Return the working tree's uncommitted changes, including new files, as one patch.
+
+    Used to keep the evidence of a blocked or crashed attempt before the
+    repository is restored. Returns {"patch": text, "files": [paths], "error": None};
+    the patch is empty when the tree is clean.
+    """
+    repo_path = get_repo_path()
+    # Staging everything first makes untracked files part of the diff; the index is unstaged again afterwards.
+    exit_code, _, stderr = run_command(["git", "add", "-A"], repo_path)
+    if exit_code != 0:
+        return {"patch": "", "files": [], "error": f"Could not stage changes: {tail(stderr, 300).strip()}"}
+    _, patch, _ = run_command(["git", "diff", "--cached", "--binary"], repo_path)
+    _, names, _ = run_command(["git", "diff", "--cached", "--name-only"], repo_path)
+    run_command(["git", "reset", "-q"], repo_path)
+    return {"patch": patch, "files": [line.strip() for line in names.splitlines() if line.strip()], "error": None}
+
+
+@mcp.tool()
+def restore_repository(repo_path: str, branch: str = "") -> dict:
+    """Put the target repository back on the base branch with a clean tree after a run.
+
+    Discards uncommitted changes and untracked files, checks out BASE_BRANCH,
+    and deletes `branch` only if it has no commits beyond the base, so a branch
+    that holds real work is kept. When `branch` is empty, the branch that was
+    checked out counts as the run's branch. This is destructive, so repo_path
+    must be the configured target repository; any other path is refused.
+    """
+    target = get_repo_path()
+    # The caller names the path on purpose, so a wrong configuration or a wrong call cannot wipe another repository.
+    if Path(repo_path).resolve() != target:
+        return {"restored": False, "error": f"Refused: {repo_path} is not the configured target repository {target}"}
+    base_branch = get_base_branch()
+    # When the caller does not know the run's branch, for example after a crash inside a graph, the branch
+    # the run left checked out is the one to judge: a run always starts from the base branch.
+    _, current, _ = run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"], target)
+    current = current.strip()
+    if not branch and current not in ("", "HEAD", base_branch):
+        branch = current
+    _, status, _ = run_command(["git", "status", "--porcelain"], target)
+    discarded = [line[3:].strip() for line in status.splitlines() if line.strip()]
+    steps = [
+        # Uncommitted edits to tracked files go first, then untracked files (ignored ones are left alone).
+        ["git", "reset", "--hard", "-q"],
+        ["git", "clean", "-fd", "-q"],
+        ["git", "checkout", "-q", base_branch],
+    ]
+    for args in steps:
+        exit_code, _, stderr = run_command(args, target)
+        if exit_code != 0:
+            return {"restored": False, "discarded": discarded, "error": f"{' '.join(args[1:])} failed: {tail(stderr, 300).strip()}"}
+    branch_deleted = False
+    # The base branch and every protected branch are never deleted, whatever was asked or checked out:
+    # a crash before the run created its branch leaves main checked out, and main must survive that.
+    deletable = bool(branch) and branch != base_branch and branch not in get_protected_branches()
+    if deletable:
+        exit_code, count, _ = run_command(["git", "rev-list", "--count", f"{base_branch}..{branch}"], target)
+        # A branch that exists and adds nothing to the base is a leftover; one with commits is evidence and stays.
+        if exit_code == 0 and count.strip() == "0":
+            run_command(["git", "branch", "-D", branch], target)
+            branch_deleted = True
+    return {"restored": True, "discarded": discarded, "branch": branch, "branch_deleted": branch_deleted, "error": None}
+
+
+@mcp.tool()
 def notify_user(
-    outcome: Literal["ready_to_review", "blocked"],
+    outcome: Literal["ready_to_review", "blocked", "needs_clarification"],
     summary: str,
     link: str = "",
 ) -> dict:
     """Report the outcome of a run to the developer.
 
     Call exactly once at the end of every run. Use "ready_to_review" when a
-    pull request was opened and "blocked" when the work could not be completed.
+    pull request was opened, "blocked" when the work could not be completed,
+    and "needs_clarification" when the request must be restated before anything
+    can be built.
     """
     # The default is relative to the server's working directory; resolve() makes the returned path absolute.
     log_path = Path(os.environ.get("NOTIFICATIONS_LOG", "runs/notifications.log")).resolve()
@@ -683,7 +750,7 @@ def notify_user(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     # UTC keeps the log consistent no matter which machine or timezone the pipeline runs in.
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    label = "READY TO REVIEW" if outcome == "ready_to_review" else "BLOCKED"
+    label = {"ready_to_review": "READY TO REVIEW", "blocked": "BLOCKED", "needs_clarification": "NEEDS CLARIFICATION"}[outcome]
     # The link, usually the pull request URL, goes on its own indented line when there is one.
     message = f"[{timestamp}] {label}: {summary}" + (f"\n  {link}" if link else "")
     # Append mode keeps the history of every run rather than only the latest.
