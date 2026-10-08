@@ -21,6 +21,9 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 # The npm package for the reference Filesystem MCP server, fetched by npx on first use.
 FILESYSTEM_SERVER_PACKAGE = "@modelcontextprotocol/server-filesystem"
+# The only GitHub tools the server is started with. Given alone, GITHUB_TOOLS makes the server expose exactly
+# these (verified live against v2.0.2), so merge_pull_request is never offered to anything.
+GITHUB_TOOLS_ALLOWED = ["create_pull_request", "list_pull_requests", "pull_request_read"]
 
 
 def get_target_repo_path():
@@ -105,6 +108,44 @@ def get_flag(name, default):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def get_reporter_settings():
+    """Return the reporter's settings: base branch, where run records go, and an optional repository override."""
+    return {
+        # The branch pull requests are opened against.
+        "base_branch": os.environ.get("BASE_BRANCH", "main"),
+        # One JSON record per run, kept for the developer and for the memory step to index later.
+        "records_path": Path(os.environ.get("RECORDS_PATH", PROJECT_ROOT / "runs" / "records")).resolve(),
+        # "owner/repo" on GitHub. Normally derived from the target's origin remote; set only to override it.
+        "repository": os.environ.get("GITHUB_REPOSITORY", ""),
+    }
+
+
+def get_github_server_config():
+    """Launch settings for the official GitHub MCP server, started with only the allowed tools.
+
+    Requires GITHUB_MCP_SERVER (path to the binary) and GITHUB_PERSONAL_ACCESS_TOKEN
+    in the environment; raises with setup instructions when either is missing.
+    """
+    binary = os.environ.get("GITHUB_MCP_SERVER")
+    if not binary or not Path(binary).is_file():
+        raise RuntimeError("GITHUB_MCP_SERVER is not set or does not point to github-mcp-server.exe. "
+                           "Download the release binary and set its path in .env.")
+    if not os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN"):
+        raise RuntimeError("GITHUB_PERSONAL_ACCESS_TOKEN is not set. Create a fine-grained token scoped to the "
+                           "target repository with Pull requests read and write, and put it in .env.")
+    return {
+        "github": {
+            "command": binary,
+            # stdio is the server's subcommand for the transport the other servers use too.
+            "args": ["stdio"],
+            "transport": "stdio",
+            # GITHUB_TOOLS alone limits the server to these tools; GITHUB_TOOLSETS is left unset on purpose,
+            # because naming any toolset would add that group's tools on top.
+            "env": {**os.environ, "GITHUB_TOOLS": ",".join(GITHUB_TOOLS_ALLOWED)},
+        },
+    }
+
+
 def get_tasks_path():
     """Return the folder generated task folders go under, defaulting to runs/tasks in this repository."""
     # The dev tools server reads the same variable with the same default, so both sides agree on the folder.
@@ -184,6 +225,9 @@ AGENT_TOOLS = {
     # The reviewer gets no MCP tool at all. Code gathers the diff, the changed files, the scan and the
     # test record and puts them in its prompt; its only tool, submit_review, is defined in pipeline/reviewer.py.
     "reviewer": [],
+    # The reporter is a code step with one model call that writes a paragraph; the model gets no tools.
+    # Code calls git_push, notify_user and the GitHub tools itself.
+    "reporter": [],
 }
 
 
