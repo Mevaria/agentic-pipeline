@@ -382,6 +382,21 @@ def test_write_task_test_rejects_bad_names_and_empty_content(tmp_path):
     assert not (tmp_path / "tasks" / "run-1").exists()
 
 
+def test_parse_github_remote_reads_https_and_ssh_forms():
+    """parse_github_remote returns owner and repo for https and ssh GitHub URLs, with or without .git, and None for anything else."""
+    assert server.parse_github_remote("https://github.com/Mevaria/reading-list.git") == ("Mevaria", "reading-list")
+    assert server.parse_github_remote("https://github.com/Mevaria/reading-list") == ("Mevaria", "reading-list")
+    assert server.parse_github_remote("git@github.com:Mevaria/reading-list.git") == ("Mevaria", "reading-list")
+    assert server.parse_github_remote("https://gitlab.com/someone/repo.git") is None
+
+
+def test_remote_repository_reports_a_non_github_origin(repo):
+    """remote_repository on a repository whose origin is a local path returns no owner and an error naming the URL."""
+    result = server.remote_repository()
+    assert result["owner"] is None
+    assert "not a GitHub repository" in result["error"]
+
+
 def test_diff_against_base_ignores_later_commits_on_main(repo):
     """diff_against_base from a branch shows the branch's own change and not a file committed to main after the branch was created."""
     git(["checkout", "-b", "feat/change"], repo)

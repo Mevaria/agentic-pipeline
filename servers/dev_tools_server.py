@@ -327,6 +327,27 @@ def run_security_scan() -> dict:
     }
 
 
+def parse_github_remote(url):
+    """Return (owner, repo) from a GitHub remote URL in https or ssh form, or None for anything else."""
+    # https://github.com/owner/repo(.git) and git@github.com:owner/repo(.git) are the two forms git produces.
+    match = re.match(r"^(?:https://github\.com/|git@github\.com:)([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", url.strip())
+    return (match.group(1), match.group(2)) if match else None
+
+
+@mcp.tool()
+def remote_repository() -> dict:
+    """Return the GitHub owner and repository name of the origin remote, so pull requests go to the right place."""
+    repo_path = get_repo_path()
+    exit_code, stdout, stderr = run_command(["git", "remote", "get-url", "origin"], repo_path)
+    if exit_code != 0:
+        return {"owner": None, "repo": None, "url": None, "error": f"No origin remote: {tail(stderr, 300).strip()}"}
+    url = stdout.strip()
+    parsed = parse_github_remote(url)
+    if parsed is None:
+        return {"owner": None, "repo": None, "url": url, "error": f"origin is not a GitHub repository: {url}"}
+    return {"owner": parsed[0], "repo": parsed[1], "url": url, "error": None}
+
+
 @mcp.tool()
 def diff_against_base() -> dict:
     """Return the checked-out branch's change as a unified diff against its merge base with BASE_BRANCH.
