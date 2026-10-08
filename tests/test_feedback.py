@@ -263,7 +263,7 @@ def owner_comment(number, body, created="2026-10-08T12:00:00Z"):
 
 def write_spec(number):
     """An author turn that writes the spec with the same type and slug as before."""
-    arguments = {"type": "feat", "short_description": "delete-book", "spec": REQUEST + " A missing id answers 404 with a JSON error."}
+    arguments = {"task_type": "feat", "short_description": "delete-book", "spec": REQUEST + " A missing id answers 404 with a JSON error."}
     return lambda messages: AIMessage(content="", tool_calls=[tool_call("write_task_spec", arguments, number)])
 
 

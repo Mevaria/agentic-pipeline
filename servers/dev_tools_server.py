@@ -26,9 +26,10 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 # Ranks Bandit's severity labels so a finding can be compared against the threshold.
 SEVERITY_ORDER = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
@@ -594,17 +595,20 @@ def format_code(fix: bool = False) -> dict:
 
 
 @mcp.tool()
-def write_task_spec(type: str, short_description: str, spec: str) -> dict:
+def write_task_spec(
+    # The parameter is not called "type" because that word is also the JSON schema keyword on every level of
+    # the schema the model reads, and a small model dropped the argument in every run while it was named that.
+    task_type: Annotated[str, Field(description="feat for new behaviour, fix for a bug; or refactor, test, docs, chore, perf, style, build, ci")],
+    short_description: Annotated[str, Field(description='Lowercase words joined by hyphens, like "delete-book"; it names the branch')],
+    spec: Annotated[str, Field(description="What must change, what must stay the same, and how the tests decide it is done, in plain English")],
+) -> dict:
     """Save the task's type, short description and spec. Call once, before writing tests.
 
-    type is one of feat, fix, refactor, test, docs, chore, perf, style, build
-    or ci. short_description is a lowercase slug such as "delete-book"; it names
-    the branch. spec is the scoped description of the change in plain English:
-    what must change, what must not, and how the tests decide it is done.
+    All three arguments are required: task_type, short_description and spec.
     """
     # Each rule is checked in turn so the error names the first thing to fix.
-    if type not in TASK_TYPES:
-        return {"saved": False, "error": f"type must be one of {sorted(TASK_TYPES)}, got {type!r}"}
+    if task_type not in TASK_TYPES:
+        return {"saved": False, "error": f"task_type must be one of {sorted(TASK_TYPES)}, got {task_type!r}"}
     if not SLUG_PATTERN.match(short_description) or len(short_description) > SLUG_LIMIT:
         return {"saved": False, "error": "short_description must be lowercase words joined by hyphens, "
                                          f"at most {SLUG_LIMIT} characters, like 'delete-book'"}
@@ -612,21 +616,22 @@ def write_task_spec(type: str, short_description: str, spec: str) -> dict:
         return {"saved": False, "error": "spec must not be empty"}
     task_folder = get_task_folder()
     task_folder.mkdir(parents=True, exist_ok=True)
-    # The same shape load_task in run_implementer reads, so the folder can go straight to the implementer.
-    task = {"type": type, "short_description": short_description, "spec": spec.strip()}
+    # The same shape load_task reads, so the folder can go straight to the implementer; the key stays "type" there.
+    task = {"type": task_type, "short_description": short_description, "spec": spec.strip()}
     (task_folder / "task.json").write_text(json.dumps(task, indent=2) + "\n", encoding="utf-8")
     return {"saved": True, "task_folder": str(task_folder)}
 
 
 @mcp.tool()
-def write_task_test(file_name: str, content: str) -> dict:
+def write_task_test(
+    file_name: Annotated[str, Field(description='A bare module name like "test_delete_book.py", no folders, not a name the repository already has')],
+    content: Annotated[str, Field(description="The complete content of the test file")],
+) -> dict:
     """Save one pytest file for the task. Call once per file; calling again replaces it.
 
-    file_name is a bare module name such as "test_delete_book.py", with no
-    folders. It must not be the name of a test file the repository already has,
-    because the file will be added to the repository's tests folder. content is
-    the complete file. Tests must reach the app only through its test client
-    and assert the status code before reading a response body.
+    The file will be added to the repository's tests folder, so its name must
+    be new. Tests must reach the app only through its test client and assert
+    the status code before reading a response body.
     """
     if not TEST_FILE_PATTERN.match(file_name):
         return {"saved": False, "error": "file_name must look like 'test_something.py', with no folders"}

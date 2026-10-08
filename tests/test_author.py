@@ -145,7 +145,7 @@ class ScriptedModel:
 
 def write_spec(task_type, number):
     """A turn that calls write_task_spec for the delete-book task with the given type."""
-    arguments = {"type": task_type, "short_description": "delete-book", "spec": REQUEST}
+    arguments = {"task_type": task_type, "short_description": "delete-book", "spec": REQUEST}
     return lambda messages: AIMessage(content="", tool_calls=[tool_call("write_task_spec", arguments, number)])
 
 
