@@ -24,6 +24,22 @@ def scrub_secrets(text):
     return scrubbed
 
 
+def innermost_error(error):
+    """Return "Type: message" for the innermost exception inside nested exception groups.
+
+    MCP sessions run in anyio task groups, so an error inside a graph reaches
+    the caller wrapped in one or more ExceptionGroups; this digs it out.
+    """
+    while isinstance(error, BaseExceptionGroup) and error.exceptions:
+        error = error.exceptions[0]
+    # The adapter raises a generic "could not list tools" error; the cause underneath says why the server died.
+    if error.__context__ is not None and "tools" in str(error):
+        error = error.__context__
+        while isinstance(error, BaseExceptionGroup) and error.exceptions:
+            error = error.exceptions[0]
+    return f"{type(error).__name__}: {error}"
+
+
 def latest_tool_results(messages):
     """Return the ToolMessages produced for the most recent AIMessage, in order."""
     results = []

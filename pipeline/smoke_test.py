@@ -19,6 +19,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from pipeline.config import get_model_name, get_server_config, get_target_repo_path, select_tools
+from pipeline.tooling import innermost_error
 
 # Model turns allowed per check before it is marked as failed for never answering.
 MAX_STEPS = 5
@@ -105,15 +106,8 @@ async def check_servers(client, server_names):
 
 def summarise_error(error):
     """Dig the innermost message out of nested exception groups."""
-    # anyio wraps server start-up failures in exception groups, often several levels deep.
-    while isinstance(error, BaseExceptionGroup) and error.exceptions:
-        error = error.exceptions[0]
-    # The adapter raises a generic "could not list tools" error; the cause underneath says why the server died.
-    if error.__context__ is not None and "tools" in str(error):
-        error = error.__context__
-        while isinstance(error, BaseExceptionGroup) and error.exceptions:
-            error = error.exceptions[0]
-    return f"{type(error).__name__}: {error}"
+    # The same unwrapping the orchestrator uses for a crashed stage.
+    return innermost_error(error)
 
 
 async def main(use_model):

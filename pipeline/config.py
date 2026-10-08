@@ -117,6 +117,8 @@ def get_reporter_settings():
         "records_path": Path(os.environ.get("RECORDS_PATH", PROJECT_ROOT / "runs" / "records")).resolve(),
         # "owner/repo" on GitHub. Normally derived from the target's origin remote; set only to override it.
         "repository": os.environ.get("GITHUB_REPOSITORY", ""),
+        # Branches the cleanup fallback may never delete; the same list the dev tools server reads.
+        "protected_branches": {name.strip() for name in os.environ.get("PROTECTED_BRANCHES", "main,master").split(",") if name.strip()},
     }
 
 
