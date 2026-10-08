@@ -25,11 +25,16 @@ DOCUMENTED_NODES = {
 }
 
 
+def is_skipped(part):
+    """Return True for a path part that names a skipped folder, including any virtual environment such as .venv-chroma."""
+    return part in SKIPPED_FOLDERS or part.startswith(".venv")
+
+
 def python_files(root):
     """Yield every .py file under root, skipping virtual environments and caches."""
     for path in sorted(root.rglob("*.py")):
         # Any skipped folder anywhere in the path excludes the file, so nested .venv folders are skipped too.
-        if SKIPPED_FOLDERS.isdisjoint(path.parts):
+        if not any(is_skipped(part) for part in path.parts):
             yield path
 
 

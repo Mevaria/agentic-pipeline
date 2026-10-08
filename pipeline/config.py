@@ -130,6 +130,54 @@ def get_feedback_settings():
     }
 
 
+def get_float(name, default):
+    """Return the environment variable `name` as a float, or `default` when it is unset."""
+    value = os.environ.get(name, str(default))
+    try:
+        return float(value)
+    except ValueError:
+        raise RuntimeError(f"{name} must be a number, got {value!r}")
+
+
+def get_memory_settings():
+    """Return the memory settings: collection name, how many past runs to look at, and the distance thresholds."""
+    return {
+        # The Chroma collection that holds one document per run record.
+        "collection": os.environ.get("MEMORY_COLLECTION", "runs"),
+        # Past runs fetched per query; only those under the threshold are shown to the author.
+        "max_results": get_int("MEMORY_MAX_RESULTS", 3),
+        # Cosine distance (0 identical, 1 unrelated) above which a past run is not shown at all. From real queries:
+        # the same request scores 0.0, the same topic reworded 0.23 to 0.49, a different topic on the same app
+        # 0.44 and up, so 0.40 keeps clear matches and drops the band where the two overlap.
+        "distance_threshold": get_float("MEMORY_DISTANCE_THRESHOLD", 0.40),
+        # Cosine distance under which a past run with an open pull request counts as a near-identical request.
+        "duplicate_threshold": get_float("MEMORY_DUPLICATE_THRESHOLD", 0.20),
+    }
+
+
+def get_chroma_server_config():
+    """Launch settings for the Chroma MCP server in persistent mode, from its own virtual environment.
+
+    chroma-mcp pins an old mcp release that cannot share our environment, so it
+    lives in .venv-chroma; CHROMA_MCP_SERVER overrides the executable's path and
+    CHROMA_DATA_PATH where the database is kept (default runs/chroma).
+    """
+    default_binary = PROJECT_ROOT / ".venv-chroma" / "Scripts" / "chroma-mcp.exe"
+    binary = os.environ.get("CHROMA_MCP_SERVER", str(default_binary))
+    if not Path(binary).is_file():
+        raise RuntimeError("CHROMA_MCP_SERVER is not set or does not point to chroma-mcp. "
+                           "Create .venv-chroma and install chroma-mcp into it, or set the path in .env.")
+    data_path = Path(os.environ.get("CHROMA_DATA_PATH", PROJECT_ROOT / "runs" / "chroma")).resolve()
+    return {
+        "chroma": {
+            "command": binary,
+            "args": ["--client-type", "persistent", "--data-dir", str(data_path)],
+            "transport": "stdio",
+            "env": {**os.environ},
+        },
+    }
+
+
 def get_github_server_config():
     """Launch settings for the official GitHub MCP server, started with only the allowed tools.
 

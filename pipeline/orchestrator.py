@@ -28,6 +28,7 @@ from pipeline.author import recursion_limit as author_recursion_limit
 from pipeline.gate import run_gate
 from pipeline.implementer import build_implementer
 from pipeline.implementer import recursion_limit as implementer_recursion_limit
+from pipeline.memory import index_record, recall, recall_block, relevant_hits
 from pipeline.reporter import report
 from pipeline.tasks import load_task
 from pipeline.tooling import call_tool, current_trace, innermost_error, scrub_secrets, start_trace, stop_trace
@@ -115,7 +116,7 @@ async def run_pipeline(repo_path, all_tools, agent_tools, models, request, run_i
     all_tools: every MCP tool, for the stages' code steps.
     agent_tools: {"author": [...], "implementer": [...]}, each agent's allowlist.
     models: {"author", "implementer", "reviewer", "reporter"}, chat models per stage (usually the same one).
-    settings: {"author", "implementer", "review", "reporter"}, each stage's settings.
+    settings: {"author", "implementer", "review", "reporter"} and, when memory is on, "memory".
     task_folder: where the author writes, TASKS_PATH/run_id; the patch of a failed attempt goes there too.
     revision: None for a fresh run, or {"branch", "pull_request", "feedback", "previous_task", "number", "max"}
         to revise an existing pull request: the author gets the feedback, the implementer continues on the
@@ -125,6 +126,8 @@ async def run_pipeline(repo_path, all_tools, agent_tools, models, request, run_i
     task_folder = Path(task_folder)
     tools_by_name = {tool.name: tool for tool in all_tools}
     base_branch = settings["implementer"]["base_branch"]
+    # Memory is on when the Chroma server's tools are present and the settings say how to use them.
+    memory_on = "chroma_query_documents" in tools_by_name and bool(settings.get("memory"))
 
     async def git(name, **arguments):
         """Call a Git server tool; every one of them takes the repository path as repo_path."""
@@ -157,6 +160,41 @@ async def run_pipeline(repo_path, all_tools, agent_tools, models, request, run_i
         path.write_text(result["patch"], encoding="utf-8")
         log(f"[cleanup] saved the uncommitted changes to {path} ({len(result['files'])} file(s))")
         return {"patch": str(path), "files": result["files"]}
+
+    async def pull_request_state(number):
+        """Return "open", "closed" or "merged" for a pull request, or "unknown" when GitHub cannot be asked."""
+        if "pull_request_read" not in tools_by_name or not record.get("repository_owner"):
+            return "unknown"
+        try:
+            owner, repo_name = record["repository_owner"]
+            data = json.loads(await call_tool(tools_by_name, "pull_request_read",
+                                              {"method": "get", "owner": owner, "repo": repo_name, "pullNumber": number}))
+        except Exception as error:
+            log(f"[recall] could not read pull request #{number}: {scrub_secrets(innermost_error(error))[:200]}")
+            return "unknown"
+        if data.get("merged") or data.get("merged_at"):
+            return "merged"
+        return data.get("state", "unknown")
+
+    async def remember(request_text):
+        """Recall similar past runs and return the memory block for the author, recording what was found."""
+        hits = await recall(tools_by_name, settings["memory"], request_text)
+        kept = relevant_hits(hits, settings["memory"])
+        states = {}
+        for hit in kept:
+            number = hit["metadata"].get("pull_request") or 0
+            if number and number not in states:
+                states[number] = await pull_request_state(number)
+        block = recall_block(kept, settings["memory"], states)
+        record["stages"]["recall"] = {
+            "hits": [{"id": hit["id"], "distance": hit["distance"], "pull_request": hit["metadata"].get("pull_request") or 0,
+                      "state": states.get(hit["metadata"].get("pull_request") or 0)} for hit in hits],
+            "shown": [hit["id"] for hit in kept],
+            "threshold": settings["memory"]["distance_threshold"],
+        }
+        log(f"[recall] {len(hits)} past run(s) found, {len(kept)} under the threshold"
+            + (f": {', '.join(f'{hit['id']} ({hit['distance']:.2f})' for hit in kept)}" if kept else ""))
+        return block
 
     async def cleanup(branch):
         """Restore the target through the server; fall back to direct git only if the server cannot be reached."""
@@ -193,12 +231,25 @@ async def run_pipeline(repo_path, all_tools, agent_tools, models, request, run_i
             raise RuntimeError(f"The target repository has uncommitted changes:\n{status}")
         await git("git_checkout", branch_name=base_branch)
         record["stages"]["preflight"] = {"clean": True, "base_branch": base_branch}
+        # The repository owner and name, for reading pull request states during recall; absent without GitHub.
+        if settings["reporter"].get("repository"):
+            record["repository_owner"] = settings["reporter"]["repository"].split("/", 1)
+        elif "remote_repository" in tools_by_name:
+            remote = await dev_tools("remote_repository")
+            record["repository_owner"] = [remote["owner"], remote["repo"]] if not remote.get("error") else None
 
         stage = "author"
         log(f"[pipeline] author on run {run_id}" + (f", revising pull request #{revision['pull_request']}" if revision else ""))
         author_graph = build_author(repo, all_tools, agent_tools["author"], models["author"], settings["author"], task_folder, log)
         # In a revision the author sees the earlier spec and tests and the owner's feedback, not only the request.
         author_input = revision_request(request, revision["previous_task"], revision["feedback"]) if revision else request
+        # A fresh run first asks memory for similar past runs; a revision already knows its pull request.
+        if memory_on and not revision:
+            stage = "recall"
+            memory_block = await remember(request)
+            stage = "author"
+            if memory_block:
+                author_input = f"{author_input}\n\n{memory_block}"
         state = await author_graph.ainvoke({"request": author_input}, {"recursion_limit": author_recursion_limit(settings["author"])})
         record["stages"]["author"] = {
             "status": state["status"], "revisions": state.get("revision", 0), "feedback": state.get("feedback", []),
@@ -279,6 +330,13 @@ async def run_pipeline(repo_path, all_tools, agent_tools, models, request, run_i
         record["evidence"] = await save_evidence()
         record["cleanup"] = await cleanup(branch)
         record["finished"] = now()
+        # The finished run goes into memory whatever its outcome, so the next request can learn from it.
+        if memory_on:
+            try:
+                record["indexed"] = bool(await index_record(tools_by_name, settings["memory"], record))
+            except Exception as error:
+                record["indexed"] = False
+                log(f"[memory] could not index the run: {scrub_secrets(innermost_error(error))[:200]}")
         # A trace started by a caller, such as the feedback runner, stays open for that caller to stop.
         if started_trace:
             stop_trace()

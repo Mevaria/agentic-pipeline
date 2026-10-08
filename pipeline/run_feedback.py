@@ -18,10 +18,12 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from pipeline.config import (
     get_author_settings,
+    get_chroma_server_config,
     get_context_size,
     get_feedback_settings,
     get_github_server_config,
     get_implementer_settings,
+    get_memory_settings,
     get_model_name,
     get_reporter_settings,
     get_review_settings,
@@ -46,9 +48,15 @@ async def main(pull_number):
     os.environ["RUN_ID"] = run_id
     task_folder = get_tasks_path() / run_id
     server_config = {**get_server_config(), **get_github_server_config()}
-    model = ChatOllama(model=get_model_name(), temperature=0, num_ctx=get_context_size())
     settings = {"author": get_author_settings(), "implementer": get_implementer_settings(),
                 "review": get_review_settings(), "reporter": get_reporter_settings(), "feedback": get_feedback_settings()}
+    # Memory is optional here too; a revision or restart that runs is indexed like any other run.
+    try:
+        server_config.update(get_chroma_server_config())
+        settings["memory"] = get_memory_settings()
+    except RuntimeError as error:
+        print(f"Memory is off: {error}\n")
+    model = ChatOllama(model=get_model_name(), temperature=0, num_ctx=get_context_size())
 
     print(f"Feedback on pull request #{pull_number}, run {run_id}\n")
     started = time.perf_counter()

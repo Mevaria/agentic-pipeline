@@ -268,6 +268,17 @@ def test_dirty_target_is_refused(repo, tmp_path):
     assert "# uncommitted edit" in (repo / "app.py").read_text()
 
 
+def test_duplicate_of_open_pr_is_a_valid_clarification(repo, tmp_path):
+    """With an author that calls request_clarification with reason duplicate_of_open_pr, the run ends as needs_clarification carrying that reason and the question about the pull request."""
+    question = "PR #2 already adds the delete route and is still open. Did you mean to revise that PR instead?"
+    agent = ScriptedAgent([ask("duplicate_of_open_pr", question, 1)])
+    state = asyncio.run(run_graph(repo, agent, tmp_path))
+    assert state["status"] == "needs_clarification"
+    assert state["clarification_reason"] == "duplicate_of_open_pr"
+    assert state["question"] == question
+    assert not (tmp_path / "tasks" / "run-1").exists()
+
+
 def test_invalid_clarification_reason_is_rejected(repo, tmp_path):
     """With an author that calls request_clarification with a reason outside the fixed set, the tool returns an error, the run does not end, and it still ends as ready once a spec and a red test are written."""
     agent = ScriptedAgent([ask("not_sure", "What should happen?", 1), write_spec("feat", 2), write_test(RED_TEST, 3), done()])

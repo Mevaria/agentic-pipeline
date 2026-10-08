@@ -50,20 +50,23 @@ CLARIFICATION_REASONS = {
     "contradicts_existing": "the request conflicts with existing code or tests",
     "unknown_reference": "the request refers to something that does not exist in the code",
     "too_broad": "the request is too large for one change",
+    "duplicate_of_open_pr": "an open pull request already implements a near-identical request",
 }
 
 
 @tool
 def request_clarification(
-    reason: Literal["behaviour_not_testable", "contradicts_existing", "unknown_reference", "too_broad"],
+    reason: Literal["behaviour_not_testable", "contradicts_existing", "unknown_reference", "too_broad", "duplicate_of_open_pr"],
     question: str,
 ) -> str:
     """Ask the developer one question instead of writing a spec, when the request cannot be specified as given.
 
     reason: behaviour_not_testable (no observable outcome to test), contradicts_existing
     (conflicts with existing code or tests), unknown_reference (refers to something not in
-    the code) or too_broad (too large for one change). question: the one question whose
-    answer would let you write the spec. Call this at most once, then reply with a one-sentence summary.
+    the code), too_broad (too large for one change) or duplicate_of_open_pr (an open pull
+    request listed in the request already implements a near-identical request). question:
+    the one question whose answer would let you write the spec, or for a duplicate, whether
+    to revise that pull request instead. Call this at most once, then reply with a one-sentence summary.
     """
     # The call itself is the signal; the check node reads its arguments from the conversation.
     return "Clarification recorded. Reply with a one-sentence summary and no further tool calls."
@@ -138,6 +141,9 @@ def author_system_prompt(repo_path):
         "- For a bug report, the first test reproduces the bug exactly as reported.\n"
         "- If the request cannot be specified as given, write nothing and call request_clarification "
         "with the reason and one question.\n"
+        "- If the request lists an open pull request from a past run that already implements a near-identical "
+        "request, write nothing and call request_clarification with reason duplicate_of_open_pr, naming that "
+        "pull request and asking whether to revise it instead.\n"
         "- When the spec and tests are written, reply with a one-sentence summary and no tool calls."
     )
 

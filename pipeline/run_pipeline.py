@@ -18,9 +18,11 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from pipeline.config import (
     get_author_settings,
+    get_chroma_server_config,
     get_context_size,
     get_github_server_config,
     get_implementer_settings,
+    get_memory_settings,
     get_model_name,
     get_reporter_settings,
     get_review_settings,
@@ -48,10 +50,16 @@ async def main(request):
     os.environ["RUN_ID"] = run_id
     task_folder = get_tasks_path() / run_id
     server_config = {**get_server_config(), **get_github_server_config()}
-    # One model instance serves every stage; the prompts, not the weights, make the agents differ.
-    model = ChatOllama(model=get_model_name(), temperature=0, num_ctx=get_context_size())
     settings = {"author": get_author_settings(), "implementer": get_implementer_settings(),
                 "review": get_review_settings(), "reporter": get_reporter_settings()}
+    # Memory is optional: without the Chroma server the run proceeds and says so, rather than failing.
+    try:
+        server_config.update(get_chroma_server_config())
+        settings["memory"] = get_memory_settings()
+    except RuntimeError as error:
+        print(f"Memory is off: {error}\n")
+    # One model instance serves every stage; the prompts, not the weights, make the agents differ.
+    model = ChatOllama(model=get_model_name(), temperature=0, num_ctx=get_context_size())
 
     print(f"Run {run_id} on {repo_path}\nModel: {get_model_name()}\n")
     started = time.perf_counter()
@@ -66,6 +74,10 @@ async def main(request):
 
     print(f"\nResult: {record['outcome'].upper()} in {minutes:.1f} min")
     stages = record["stages"]
+    if "recall" in stages:
+        shown = stages["recall"]["shown"]
+        print(f"Memory: {len(stages['recall']['hits'])} past run(s) found, {len(shown)} shown to the author"
+              + (f" ({', '.join(shown)})" if shown else ""))
     if record["outcome"] == "needs_clarification":
         author = stages["author"]
         print(f"The author asks for clarification ({author['reason']}):\n  {author['question']}\nRerun with a clearer request.")

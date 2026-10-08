@@ -9,14 +9,17 @@ is always left on its base branch with a clean tree.
 
 import asyncio
 import json
+import os
 import subprocess
 from contextlib import AsyncExitStack
+from pathlib import Path
 
 import pytest
 from langchain_core.messages import AIMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-from pipeline.config import get_server_config, select_tools
+from pipeline.config import PROJECT_ROOT, get_server_config, select_tools
+from pipeline.memory import index_record, recall
 from pipeline.orchestrator import run_pipeline
 from pipeline.tooling import open_tools
 
@@ -303,6 +306,67 @@ def test_crash_in_a_stage_is_recorded_and_cleaned_up_through_the_tool(repo, tmp_
     assert not any("could not be reached" in line for line in lines)
     assert "BLOCKED: The run crashed in the implementer stage: RuntimeError: boom" in (tmp_path / "notifications.log").read_text()
     assert target_is_clean_on_main(repo)
+
+
+CHROMA = Path(os.environ.get("CHROMA_MCP_SERVER", PROJECT_ROOT / ".venv-chroma" / "Scripts" / "chroma-mcp.exe"))
+MEMORY_SETTINGS = {"collection": "runs", "max_results": 3, "distance_threshold": 0.45, "duplicate_threshold": 0.20}
+
+
+def ask_duplicate(number):
+    """An author turn that asks whether to revise the open pull request instead."""
+    arguments = {"reason": "duplicate_of_open_pr", "question": "PR #9 already does this and is still open. Revise that PR instead?"}
+    return lambda messages: AIMessage(content="", tool_calls=[tool_call("request_clarification", arguments, number)])
+
+
+class RecordingAgent(ScriptedAgent):
+    """A scripted agent that also keeps the prompt it was given, so a test can check the memory block reached it."""
+
+    def __init__(self, turns):
+        """Store the turns and start the prompt list."""
+        super().__init__(turns)
+        self.prompts_seen = []
+
+    async def ainvoke(self, messages):
+        """Record the task prompt and play the next turn."""
+        self.prompts_seen.append(messages[1].content)
+        return await super().ainvoke(messages)
+
+
+def test_memory_surfaces_an_open_pull_request_for_the_same_request_and_the_author_asks(repo, tmp_path, monkeypatch):
+    """With the same request already in memory and its pull request open, the author's prompt names the open pull request as a near-identical request, the scripted author asks duplicate_of_open_pr, the run ends as needs_clarification, and the run itself is indexed."""
+    if not CHROMA.is_file():
+        pytest.skip("chroma-mcp is not installed in .venv-chroma")
+    chroma = {"chroma": {"command": str(CHROMA), "args": ["--client-type", "persistent", "--data-dir", str(tmp_path / "chroma")],
+                         "transport": "stdio", "env": {**os.environ}}}
+    settings = {**SETTINGS, "memory": MEMORY_SETTINGS, "reporter": {**SETTINGS["reporter"], "records_path": tmp_path / "records"}}
+    previous = {"run_id": "run-0", "request": REQUEST, "outcome": "ready_to_review", "finished": "2026-10-08T10:00:00+00:00",
+                "task": {"type": "feat", "short_description": "delete-book"},
+                "stages": {"implementer": {"branch": "feat/delete-book"}, "reporter": {"steps": {"pull_request": {"number": 9, "url": PR_URL}}}}}
+    author = RecordingAgent([ask_duplicate(1)])
+
+    async def scenario():
+        """Index the previous run, then run the pipeline with memory and a fake GitHub that says the pull request is open."""
+        server_config = {**get_server_config(), **chroma}
+        github = [FakeTool("list_pull_requests", "[]"), FakeTool("create_pull_request", json.dumps({"html_url": PR_URL})),
+                  FakeTool("pull_request_read", json.dumps({"number": 9, "state": "open", "merged": False}))]
+        async with AsyncExitStack() as exit_stack:
+            all_tools = await open_tools(exit_stack, MultiServerMCPClient(server_config), list(server_config))
+            tools_by_name = {tool.name: tool for tool in all_tools}
+            await index_record(tools_by_name, MEMORY_SETTINGS, previous)
+            agent_tools = {name: select_tools(all_tools, name) for name in ("author", "implementer")}
+            models = {"author": ScriptedModel(author), "implementer": ScriptedModel(ScriptedAgent([])),
+                      "reviewer": ScriptedModel(ScriptedAgent([])), "reporter": ScriptedModel(None)}
+            record = await run_pipeline(repo, [*all_tools, *github], agent_tools, models, REQUEST, "run-1",
+                                        tmp_path / "tasks" / "run-1", settings, log=lambda message: None)
+            return record, await recall(tools_by_name, MEMORY_SETTINGS, REQUEST)
+    record, hits = asyncio.run(scenario())
+    assert record["outcome"] == "needs_clarification"
+    assert record["stages"]["author"]["reason"] == "duplicate_of_open_pr"
+    assert record["stages"]["recall"]["shown"] == ["run-0"]
+    assert record["stages"]["recall"]["hits"][0]["state"] == "open"
+    assert "An open pull request #9 already implements a near-identical request." in author.prompts_seen[0]
+    assert record["indexed"] is True
+    assert sorted(hit["id"] for hit in hits) == ["run-0", "run-1"]
 
 
 def test_fallback_restores_directly_when_the_restore_tool_is_unreachable(repo, tmp_path):
