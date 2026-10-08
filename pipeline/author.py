@@ -34,7 +34,7 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES, add_messages
 from langgraph.prebuilt import ToolNode
 
 from pipeline.tasks import load_task
-from pipeline.tooling import call_tool, latest_tool_results, scrub_secrets
+from pipeline.tooling import call_tool, latest_tool_results, record_tool_results, scrub_secrets
 
 # Folder inside the target repository that holds its tests, which the author must read but never write.
 TESTS_DIR = "tests"
@@ -129,8 +129,9 @@ def author_system_prompt(repo_path):
         f"- First read the code: list {repo_path}, then read app.py and the files in its {TESTS_DIR} folder, "
         "so your tests fit the app and match the style of the existing tests.\n"
         f"- Use absolute paths inside {repo_path} when reading.\n"
-        "- Call write_task_spec once: type is feat for new behaviour or fix for a bug, short_description is a "
-        "slug like delete-book, and spec says exactly what must change and what must stay the same.\n"
+        "- Call write_task_spec once, with all three arguments: task_type is feat for new behaviour or fix for a "
+        "bug, short_description is a slug like delete-book, and spec says exactly what must change and what "
+        "must stay the same.\n"
         "- Call write_task_test for each test file, with a new file name. The tests must fail now and pass "
         "once the change is made. Reach the app only through its Flask test client, assert the status code "
         "before reading a response body, and never import a name that does not exist yet.\n"
@@ -230,6 +231,8 @@ def build_author(repo_path, all_tools, agent_tools, model, settings, task_folder
         # What the tools answered since the last step, so a run's log shows refusals and errors, not only call names.
         for result in latest_tool_results(state["messages"]):
             log(f"[tool] {result.name} ({result.status}): {scrub_secrets(result.content)[:TOOL_LOG_LIMIT]}")
+        # The full calls and results go to the run's tool log, so the evidence never depends on what was printed.
+        record_tool_results(state["messages"])
         response = await model_with_tools.ainvoke(state["messages"])
         # Log the tool names so a run can be followed without printing the whole conversation.
         for tool_call in response.tool_calls:

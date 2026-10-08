@@ -164,7 +164,7 @@ class FakeTool:
 
 def write_spec(number):
     """An author turn that writes the delete-book spec."""
-    arguments = {"type": "feat", "short_description": "delete-book", "spec": REQUEST}
+    arguments = {"task_type": "feat", "short_description": "delete-book", "spec": REQUEST}
     return lambda messages: AIMessage(content="", tool_calls=[tool_call("write_task_spec", arguments, number)])
 
 
@@ -247,6 +247,15 @@ def test_request_becomes_a_pull_request(repo, tmp_path):
     assert record["evidence"] is None
     assert target_is_clean_on_main(repo)
     assert "feat/delete-book" in git(["branch"], tmp_path / "remote.git")
+    # Every tool call of the run is in the tool log the record points at, from code and from the models alike.
+    log_path = tmp_path / "records" / "run-1-tools.jsonl"
+    assert record["tool_log"] == str(log_path)
+    entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    model_calls = [entry for entry in entries if entry["source"] == "model"]
+    assert any(entry["tool"] == "write_task_spec" and entry["arguments"]["task_type"] == "feat" and '"saved": true' in entry["result"] for entry in model_calls)
+    assert any(entry["tool"] == "write_file" and entry["arguments"]["path"].endswith("app.py") for entry in model_calls)
+    assert any(entry["source"] == "code" and entry["tool"] == "run_tests" for entry in entries)
+    assert any(entry["source"] == "code" and entry["tool"] == "restore_repository" for entry in entries)
 
 
 def test_clarification_ends_the_run_before_any_branch(repo, tmp_path):

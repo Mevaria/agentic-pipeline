@@ -14,18 +14,22 @@ from contextlib import AsyncExitStack
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
+from pathlib import Path
+
 from pipeline.config import (
     get_context_size,
     get_implementer_settings,
     get_model_name,
+    get_reporter_settings,
     get_server_config,
     get_target_repo_path,
+    new_run_id,
     select_tools,
 )
 from pipeline.implementer import build_implementer, recursion_limit
 # load_task is shared with the author; importing it here keeps "from pipeline.run_implementer import load_task" working.
 from pipeline.tasks import load_task
-from pipeline.tooling import open_tools
+from pipeline.tooling import open_tools, start_trace
 
 
 async def main(task_folder):
@@ -36,6 +40,9 @@ async def main(task_folder):
     task = load_task(task_folder)
     repo_path = get_target_repo_path()
     settings = get_implementer_settings()
+    # Every tool call of the run goes to a JSON-lines log next to the run records, named by the task folder and the time.
+    tool_log = get_reporter_settings()["records_path"] / f"{Path(task_folder).name}-implementer-{new_run_id()}-tools.jsonl"
+    start_trace(tool_log)
     server_config = get_server_config()
     # temperature=0 makes runs as repeatable as the model allows; num_ctx sets the context window Ollama allocates.
     model = ChatOllama(model=get_model_name(), temperature=0, num_ctx=get_context_size())
@@ -62,6 +69,7 @@ async def main(task_folder):
     # Reflections show what the model learned between attempts, which is useful evidence for the report.
     for number, reflection in enumerate(state.get("reflections", []), 1):
         print(f"Lesson from attempt {number}: {reflection}")
+    print(f"Tool log: {tool_log}")
 
 
 if __name__ == "__main__":

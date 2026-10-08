@@ -30,7 +30,7 @@ from pipeline.implementer import build_implementer
 from pipeline.implementer import recursion_limit as implementer_recursion_limit
 from pipeline.reporter import report
 from pipeline.tasks import load_task
-from pipeline.tooling import call_tool, innermost_error, scrub_secrets
+from pipeline.tooling import call_tool, current_trace, innermost_error, scrub_secrets, start_trace, stop_trace
 
 # File name of the patch that keeps a blocked or crashed attempt's uncommitted changes, in the run's task folder.
 PATCH_NAME = "uncommitted.patch"
@@ -176,8 +176,12 @@ async def run_pipeline(repo_path, all_tools, agent_tools, models, request, run_i
                 + (f", deleted empty branch {branch}" if result.get("branch_deleted") else ""))
         return result
 
+    # Every tool call of the run, by code or by a model, goes to a JSON-lines file next to the record. It is
+    # kept under runs/records rather than in the task folder, which a clarification removes.
+    started_trace = start_trace(Path(settings["reporter"]["records_path"]) / f"{run_id}-tools.jsonl")
     record = {
         "run_id": run_id, "request": request, "started": now(), "task_folder": str(task_folder),
+        "tool_log": str(current_trace()),
         "stages": {}, "outcome": None, "crashed_in": None, "error": None, "evidence": None, "cleanup": None,
     }
     branch = None
@@ -275,3 +279,6 @@ async def run_pipeline(repo_path, all_tools, agent_tools, models, request, run_i
         record["evidence"] = await save_evidence()
         record["cleanup"] = await cleanup(branch)
         record["finished"] = now()
+        # A trace started by a caller, such as the feedback runner, stays open for that caller to stop.
+        if started_trace:
+            stop_trace()

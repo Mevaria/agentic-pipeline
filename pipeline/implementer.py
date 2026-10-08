@@ -28,7 +28,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES, add_messages
 from langgraph.prebuilt import ToolNode
 
-from pipeline.tooling import call_tool, latest_tool_results, scrub_secrets
+from pipeline.tooling import call_tool, latest_tool_results, record_tool_results, scrub_secrets
 
 # Folder inside the target repository that holds the tests; everything in it is protected from the model.
 TESTS_DIR = "tests"
@@ -209,6 +209,8 @@ def build_implementer(repo_path, all_tools, agent_tools, model, settings, log=pr
         # What the tools answered since the last step, so a run's log shows refusals and errors, not only call names.
         for result in latest_tool_results(state["messages"]):
             log(f"[tool] {result.name} ({result.status}): {scrub_secrets(result.content)[:TOOL_LOG_LIMIT]}")
+        # The full calls and results go to the run's tool log, so the evidence never depends on what was printed.
+        record_tool_results(state["messages"])
         response = await model_with_tools.ainvoke(state["messages"])
         # Log the tool names so a run can be followed without printing the whole conversation.
         for tool_call in response.tool_calls:
@@ -300,6 +302,13 @@ def build_implementer(repo_path, all_tools, agent_tools, model, settings, log=pr
         if format_result.get("error"):
             log(f"[finish] formatter error, committing unformatted: {format_result['error']}")
         status = await git("git_status")
+        # In continue mode the branch already has a commit for the feature; this commit is about the revision.
+        revising = bool(task.get("review_findings"))
+        if revising:
+            subject = ("This commit revises an earlier change on the same branch to address these findings. Describe "
+                       f"what this revision changes, not the original feature:\n{task['review_findings']}\n\nTask:\n{task['spec']}")
+        else:
+            subject = f"Task:\n{task['spec']}"
         # The model writes the message; the code decides whether it is acceptable and does the commit.
         response = await model.ainvoke([
             SystemMessage(
@@ -307,14 +316,15 @@ def build_implementer(repo_path, all_tools, agent_tools, model, settings, log=pr
                 "type: short description, lowercase, under 72 characters, no trailing period. "
                 "Reply with the message only."
             ),
-            HumanMessage(f"Type: {task['type']}\nTask:\n{task['spec']}\n\nChanged files:\n{status}"),
+            HumanMessage(f"Type: {task['type']}\n{subject}\n\nChanged files:\n{status}"),
         ])
         # Keep the first line only, after stripping whitespace and the backticks small models like to wrap it in.
         message = str(response.content).strip().strip("`").strip().splitlines()[0] if response.content else ""
         # A message that breaks the convention is replaced, not committed, so the history stays clean.
         if not COMMIT_PATTERN.match(message):
             log(f"[finish] model's commit message was not valid, using a fallback: {message!r}")
-            message = f"{task['type']}: {task['short_description'].replace('-', ' ')}"
+            description = task["short_description"].replace("-", " ")
+            message = f"{task['type']}: {'revise ' if revising else ''}{description}"
         # Stage everything, including the given tests, so the branch carries the tests that define the change.
         await git("git_add", files=["."])
         commit_result = await git("git_commit", message=message)

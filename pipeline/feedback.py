@@ -25,7 +25,7 @@ from pathlib import Path
 from pipeline.orchestrator import PIPELINE_NOTE_MARKER, run_pipeline
 from pipeline.records import write_record
 from pipeline.tasks import load_task
-from pipeline.tooling import call_tool, innermost_error, scrub_secrets
+from pipeline.tooling import call_tool, current_trace, innermost_error, scrub_secrets, start_trace, stop_trace
 
 # The command that triggers a revision, at the very start of a comment.
 REVISE_COMMAND = "/revise"
@@ -140,6 +140,17 @@ def handlings_for(records, pull_number):
 async def handle_feedback(repo_path, all_tools, agent_tools, models, pull_number, run_id, task_folder, settings, log=print):
     """Read a pull request's state and comments, decide what the loop does, do it, and return the feedback record."""
     tools_by_name = {tool.name: tool for tool in all_tools}
+    # The trace covers the GitHub reads made here as well as any run that follows; the orchestrator joins it.
+    started_trace = start_trace(Path(settings["reporter"]["records_path"]) / f"{run_id}-tools.jsonl")
+    try:
+        return await _handle_feedback(repo_path, all_tools, tools_by_name, agent_tools, models, pull_number, run_id, task_folder, settings, log)
+    finally:
+        if started_trace:
+            stop_trace()
+
+
+async def _handle_feedback(repo_path, all_tools, tools_by_name, agent_tools, models, pull_number, run_id, task_folder, settings, log):
+    """The body of handle_feedback, run while the tool log is open."""
 
     async def github(name, **arguments):
         """Call a GitHub tool and parse its JSON reply, returning an empty list for anything unreadable."""
@@ -181,6 +192,7 @@ async def handle_feedback(repo_path, all_tools, agent_tools, models, pull_number
 
     record = {
         "kind": "feedback", "run_id": run_id, "pull_request": pull_number, "repository": f"{owner}/{repo_name}",
+        "tool_log": str(current_trace()),
         "state": "merged" if merged else state, "branch": branch, "owner": owner,
         "handled_ids": [], "ignored": [{"id": entry["id"], "author": entry["author"]} for entry in feedback["ignored"]],
         "previous_run": (previous_run or {}).get("run_id"), "action": None, "run": None,

@@ -30,7 +30,7 @@ from pipeline.records import write_record
 from pipeline.reporter import report
 from pipeline.reviewer import describe_findings
 from pipeline.tasks import load_task
-from pipeline.tooling import open_tools
+from pipeline.tooling import open_tools, start_trace
 
 
 async def main(task_folder, branch):
@@ -43,8 +43,9 @@ async def main(task_folder, branch):
     # The GitHub server is added only here; the other runners never start it.
     server_config = {**get_server_config(), **get_github_server_config()}
     model = ChatOllama(model=get_model_name(), temperature=0, num_ctx=get_context_size())
-    # A generated task folder is named by its run id, which also names the record.
+    # A generated task folder is named by its run id, which also names the record and the tool log.
     run_id = Path(task_folder).name
+    start_trace(get_reporter_settings()["records_path"] / f"{run_id}-tools.jsonl")
 
     async with AsyncExitStack() as exit_stack:
         all_tools = await open_tools(exit_stack, MultiServerMCPClient(server_config), list(server_config))

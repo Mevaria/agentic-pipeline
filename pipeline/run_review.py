@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import time
 from contextlib import AsyncExitStack
+from pathlib import Path
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
@@ -18,15 +19,17 @@ from pipeline.config import (
     get_context_size,
     get_implementer_settings,
     get_model_name,
+    get_reporter_settings,
     get_review_settings,
     get_server_config,
     get_target_repo_path,
+    new_run_id,
     select_tools,
 )
 from pipeline.gate import run_gate
 from pipeline.reviewer import describe_findings
 from pipeline.tasks import load_task
-from pipeline.tooling import open_tools
+from pipeline.tooling import open_tools, start_trace
 
 
 async def main(task_folder, branch):
@@ -36,6 +39,9 @@ async def main(task_folder, branch):
 
     task = load_task(task_folder)
     repo_path = get_target_repo_path()
+    # Every tool call of the run goes to a JSON-lines log next to the run records.
+    tool_log = get_reporter_settings()["records_path"] / f"{Path(task_folder).name}-review-{new_run_id()}-tools.jsonl"
+    start_trace(tool_log)
     server_config = get_server_config()
     # One model instance serves both roles; the prompts, not the weights, make the reviewer and the implementer differ.
     model = ChatOllama(model=get_model_name(), temperature=0, num_ctx=get_context_size())
@@ -62,6 +68,7 @@ async def main(task_folder, branch):
     for number, fix in enumerate(outcome["fixes"], 1):
         print(f"\nFix {number}: {fix['status']} after {fix['attempt']} attempt(s)"
               + (f", commit: {fix['commit_message']}" if fix["status"] == "passed" else ""))
+    print(f"Tool log: {tool_log}")
 
 
 if __name__ == "__main__":

@@ -21,13 +21,14 @@ from pipeline.config import (
     get_author_settings,
     get_context_size,
     get_model_name,
+    get_reporter_settings,
     get_server_config,
     get_target_repo_path,
     get_tasks_path,
     new_run_id,
     select_tools,
 )
-from pipeline.tooling import open_tools
+from pipeline.tooling import open_tools, start_trace
 
 
 async def main(request):
@@ -42,6 +43,9 @@ async def main(request):
     # when it builds the launch settings, so the id must be set before that call.
     os.environ["RUN_ID"] = run_id
     task_folder = get_tasks_path() / run_id
+    # Every tool call of the run goes to a JSON-lines log next to the run records.
+    tool_log = get_reporter_settings()["records_path"] / f"{run_id}-tools.jsonl"
+    start_trace(tool_log)
     server_config = get_server_config()
     # temperature=0 makes runs as repeatable as the model allows; num_ctx sets the context window Ollama allocates.
     model = ChatOllama(model=get_model_name(), temperature=0, num_ctx=get_context_size())
@@ -72,6 +76,7 @@ async def main(request):
     # The findings from each revision show why the tests were rejected, which is useful evidence for the report.
     for number, findings in enumerate(state.get("feedback", []), 1):
         print(f"Findings before revision {number}:\n{findings}")
+    print(f"Tool log: {tool_log}")
 
 
 if __name__ == "__main__":
