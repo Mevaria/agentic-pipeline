@@ -82,6 +82,19 @@ def get_author_settings():
     }
 
 
+def get_review_settings():
+    """Return the review gate's settings: base branch, review-round cap and tool steps per attempt."""
+    return {
+        # The branch the change is diffed against, the same one the other agents use.
+        "base_branch": os.environ.get("BASE_BRANCH", "main"),
+        # Reviews before the gate stops as blocked, counting the first one; each block in between sends
+        # the findings to the implementer.
+        "max_review_rounds": get_int("MAX_REVIEW_ROUNDS", 2),
+        # Model turns the reviewer gets to produce its verdict before the gate fails closed.
+        "max_tool_steps": get_int("MAX_TOOL_STEPS", 12),
+    }
+
+
 def get_tasks_path():
     """Return the folder generated task folders go under, defaulting to runs/tasks in this repository."""
     # The dev tools server reads the same variable with the same default, so both sides agree on the folder.
@@ -158,6 +171,9 @@ AGENT_TOOLS = {
         "write_task_test",
         # request_clarification is not an MCP tool; pipeline/author.py defines it and adds it to this list.
     ],
+    # The reviewer gets no MCP tool at all. Code gathers the diff, the changed files, the scan and the
+    # test record and puts them in its prompt; its only tool, submit_review, is defined in pipeline/reviewer.py.
+    "reviewer": [],
 }
 
 
