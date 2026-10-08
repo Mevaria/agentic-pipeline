@@ -8,7 +8,7 @@ does its work in a fixed order with the tools called by code:
     3. push the branch with git_push (protected branches are refused by the server)
     4. reuse an open pull request for the branch if one exists, otherwise open one
     5. notify_user with the outcome and the link
-    6. write one JSON record of the run under the records folder
+    6. return the record of what happened, for the top-level runner to write
 
 The pull request body is a template filled by code from the spec, the tests
 added, the review summary and the non-blocking findings. The model is called
@@ -21,7 +21,6 @@ record and a rerun can continue without repeating the push.
 import json
 import re
 from datetime import datetime, timezone
-from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -87,8 +86,9 @@ async def describe_change(model, task, review, log):
         response = await model.ainvoke([
             SystemMessage(
                 "Write one short paragraph, three sentences at most, for the summary of a pull request. "
-                "Say what changed and why, in plain language for a colleague skimming the pull request. "
-                "No headings, no lists, no code."
+                "Say what the change does and why, in plain language for a colleague skimming the pull request. "
+                "Use a neutral voice that describes the change itself, for example \"Adds a route that ...\". "
+                "Never write in the first person. No headings, no lists, no code."
             ),
             HumanMessage(f"Request:\n{task['spec']}\n\nDiff:\n{review.get('diff', '')[:DIFF_LIMIT]}"),
         ])
@@ -127,7 +127,7 @@ async def report(repo_path, all_tools, model, task, branch, review, run_id, sett
     }
 
     async def finish(outcome, summary, link="", error=None):
-        """Notify the developer, complete the record, write it, and return it."""
+        """Notify the developer, complete the record, and return it for the caller to write."""
         record["outcome"] = outcome
         record["error"] = scrub_secrets(error)[:ERROR_LIMIT] if error else None
         try:
@@ -137,9 +137,6 @@ async def report(repo_path, all_tools, model, task, branch, review, run_id, sett
         except Exception as notify_error:
             log(f"[reporter] notification failed: {scrub_secrets(notify_error)[:200]}")
         record["finished"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        records_path = Path(settings["records_path"])
-        records_path.mkdir(parents=True, exist_ok=True)
-        (records_path / f"{run_id}.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
         log(f"[reporter] {outcome}: {summary}")
         return record
 

@@ -17,6 +17,7 @@ from langchain_core.messages import AIMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from pipeline.config import get_server_config
+from pipeline.records import write_record
 from pipeline.reporter import parse_pull_request, pull_request_body, report
 from pipeline.tooling import open_tools, scrub_secrets
 
@@ -158,9 +159,10 @@ def test_approved_change_is_pushed_opened_notified_and_recorded(repo, tmp_path):
         assert expected in call["body"]
     log = (tmp_path / "notifications.log").read_text()
     assert "READY TO REVIEW: fix: blank title (fix/blank-title)" in log and PR_URL in log
-    saved = json.loads((tmp_path / "records" / "run-1.json").read_text())
+    assert record["pull_request_body"] == call["body"]
+    # The reporter returns the record; the top-level runner writes it.
+    saved = json.loads(write_record(tmp_path / "records", "run-1", record).read_text())
     assert saved["outcome"] == "ready_to_review" and saved["branch"] == "fix/blank-title"
-    assert saved["pull_request_body"] == call["body"]
 
 
 def test_existing_open_pull_request_is_reused(repo, tmp_path):
@@ -229,7 +231,7 @@ def test_token_never_reaches_logs_or_records(repo, tmp_path, monkeypatch):
     assert record["outcome"] == "blocked"
     assert token not in "\n".join(lines)
     assert token not in record["error"] and "<redacted>" in record["error"]
-    assert token not in (tmp_path / "records" / "run-1.json").read_text()
+    assert token not in write_record(tmp_path / "records", "run-1", record).read_text()
     assert token not in (tmp_path / "notifications.log").read_text()
 
 

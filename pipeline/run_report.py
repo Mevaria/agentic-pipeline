@@ -26,6 +26,7 @@ from pipeline.config import (
     select_tools,
 )
 from pipeline.gate import run_gate
+from pipeline.records import write_record
 from pipeline.reporter import report
 from pipeline.reviewer import describe_findings
 from pipeline.tasks import load_task
@@ -54,6 +55,8 @@ async def main(task_folder, branch):
                                  get_implementer_settings(), get_review_settings())
         record = await report(repo_path, all_tools, model, task, branch, outcome["review"], run_id, get_reporter_settings())
         minutes = (time.perf_counter() - started) / 60
+    # The top-level runner writes the record, so a standalone report and a full pipeline run never both write one.
+    record_path = write_record(get_reporter_settings()["records_path"], run_id, record)
 
     print(f"\nGate: {outcome['status'].upper()} after {len(outcome['rounds'])} review round(s)")
     print(f"Reporter: {record['outcome'].upper()} in {minutes:.1f} min")
@@ -63,7 +66,7 @@ async def main(task_folder, branch):
         print(f"Error: {record['error']}")
     if outcome["review"]["non_blocking_findings"]:
         print("Non-blocking findings in the pull request body:\n" + describe_findings(outcome["review"]["non_blocking_findings"]))
-    print(f"Record: {get_reporter_settings()['records_path'] / (run_id + '.json')}")
+    print(f"Record: {record_path}")
 
 
 if __name__ == "__main__":
