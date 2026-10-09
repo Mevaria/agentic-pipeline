@@ -259,6 +259,8 @@ def test_request_becomes_a_pull_request(repo, tmp_path):
     assert any(entry["tool"] == "write_file" and entry["arguments"]["path"].endswith("app.py") for entry in model_calls)
     assert any(entry["source"] == "code" and entry["tool"] == "run_tests" for entry in entries)
     assert any(entry["source"] == "code" and entry["tool"] == "restore_repository" for entry in entries)
+    # The pipeline's own LangChain tools are logged like the MCP ones, including the call that ends the review.
+    assert any(entry["tool"] == "submit_review" and entry["arguments"] == {"findings": [], "summary": "Clean."} and entry["error"] is None for entry in model_calls)
 
 
 def test_clarification_ends_the_run_before_any_branch(repo, tmp_path):
@@ -272,6 +274,12 @@ def test_clarification_ends_the_run_before_any_branch(repo, tmp_path):
     assert "NEEDS CLARIFICATION: too_broad: Which books may be deleted?" in (tmp_path / "notifications.log").read_text()
     assert git(["branch"], repo).split() == ["*", "main"]
     assert target_is_clean_on_main(repo)
+    # The clarification call ends the attempt from the tools side, and is still in the tool log with its arguments.
+    entries = [json.loads(line) for line in (tmp_path / "records" / "run-1-tools.jsonl").read_text(encoding="utf-8").splitlines()]
+    asked = [entry for entry in entries if entry["tool"] == "request_clarification"]
+    assert len(asked) == 1 and asked[0]["source"] == "model" and asked[0]["arguments"]["reason"] == "too_broad"
+    assert asked[0]["arguments"]["question"] == "Which books may be deleted?"
+    assert asked[0]["error"] is None and asked[0]["result"].startswith("Clarification recorded")
 
 
 def test_blocked_implementer_keeps_a_patch_and_leaves_no_branch(repo, tmp_path):

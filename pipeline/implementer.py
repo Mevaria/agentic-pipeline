@@ -26,9 +26,8 @@ from typing import Annotated, TypedDict
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES, add_messages
-from langgraph.prebuilt import ToolNode
 
-from pipeline.tooling import call_tool, latest_tool_results, record_tool_results, scrub_secrets
+from pipeline.tooling import call_tool, latest_tool_results, scrub_secrets, traced_tool_node
 
 # Folder inside the target repository that holds the tests; everything in it is protected from the model.
 TESTS_DIR = "tests"
@@ -209,8 +208,6 @@ def build_implementer(repo_path, all_tools, agent_tools, model, settings, log=pr
         # What the tools answered since the last step, so a run's log shows refusals and errors, not only call names.
         for result in latest_tool_results(state["messages"]):
             log(f"[tool] {result.name} ({result.status}): {scrub_secrets(result.content)[:TOOL_LOG_LIMIT]}")
-        # The full calls and results go to the run's tool log, so the evidence never depends on what was printed.
-        record_tool_results(state["messages"])
         response = await model_with_tools.ainvoke(state["messages"])
         # Log the tool names so a run can be followed without printing the whole conversation.
         for tool_call in response.tool_calls:
@@ -339,9 +336,9 @@ def build_implementer(repo_path, all_tools, agent_tools, model, settings, log=pr
     graph = StateGraph(ImplementerState)
     graph.add_node("prepare", prepare)
     graph.add_node("agent", agent)
-    # ToolNode runs the calls in the last AIMessage; handle_tool_errors turns a failing tool into an error
-    # message the model sees, instead of an exception that ends the run.
-    graph.add_node("tools", ToolNode(agent_tools, handle_tool_errors=True))
+    # The traced node runs the calls in the last AIMessage like ToolNode, turns a failing tool into an error
+    # message the model sees, and logs every call with its result to the run's tool log.
+    graph.add_node("tools", traced_tool_node(agent_tools))
     graph.add_node("verify", verify)
     graph.add_node("reflect", reflect)
     graph.add_node("finish", finish)

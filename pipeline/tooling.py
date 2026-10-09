@@ -55,22 +55,37 @@ def trace_tool(source, name, arguments, result=None, error=None):
         handle.write(json.dumps(entry) + "\n")
 
 
-def record_tool_results(messages):
-    """Write the latest model-requested tool calls and their results to the tool log, matching results to calls by id."""
-    results = latest_tool_results(messages)
-    if not results:
-        return
-    # The AIMessage before the results holds the calls, with the arguments the model chose.
-    calls = {}
-    for message in reversed(messages):
-        if isinstance(message, AIMessage):
-            calls = {call["id"]: call for call in message.tool_calls}
-            break
+def record_tool_calls(request, results):
+    """Write a model's tool calls and their results to the tool log, matching each result to its call by id."""
+    calls = {call["id"]: call for call in request.tool_calls}
     for result in results:
         call = calls.get(result.tool_call_id, {})
         content = tool_text(result.content)
         trace_tool("model", result.name or call.get("name"), call.get("args", {}),
                    result=None if result.status == "error" else content, error=content if result.status == "error" else None)
+
+
+def traced_tool_node(tools):
+    """Return a graph node that runs the model's tool calls like ToolNode and logs every one of them as it runs.
+
+    Logging here, rather than when the model next looks at the results, catches
+    the calls that end a loop, such as submit_review and request_clarification,
+    which no later model turn ever sees. MCP tools and the pipeline's own
+    LangChain tools are logged the same way.
+    """
+    # Imported here so that importing this module does not require langgraph.
+    from langgraph.prebuilt import ToolNode
+
+    # handle_tool_errors turns a failing tool into an error message the model sees, not an exception.
+    node = ToolNode(tools, handle_tool_errors=True)
+
+    async def run(state, config):
+        """Run the calls in the last AIMessage, log them with their results, and return the tool messages."""
+        output = await node.ainvoke(state, config)
+        record_tool_calls(state["messages"][-1], output["messages"])
+        return output
+
+    return run
 
 # Environment variables whose values must never appear in a log or a record.
 SECRET_NAME_PATTERN = re.compile(r"TOKEN|SECRET|PASSWORD|API_KEY", re.I)
