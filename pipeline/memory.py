@@ -19,10 +19,18 @@ COLLECTION_METADATA = {"hnsw:space": "cosine"}
 EXCERPT_LIMIT = 300
 
 
+def issue_text(issue):
+    """Return an issue's own words, title then body, which is what memory embeds for a run that came from an issue."""
+    return f"{issue.get('title') or ''}\n\n{issue.get('body') or ''}".strip()
+
+
 def run_document(record):
     """Turn a run record into (id, text, metadata) for the collection; returns None for a record without a request."""
+    # A run from an issue embeds the issue's title and body, not the framing and markers the author was shown,
+    # so its distance to a typed request about the same change is measured on the words that matter.
     # Records written by the standalone review and report runner have no request; the spec stands in for it.
-    request = record.get("request") or (record.get("task") or {}).get("spec")
+    issue = record.get("issue") or {}
+    request = (issue_text(issue) if issue.get("number") else "") or record.get("request") or (record.get("task") or {}).get("spec")
     if not request or not record.get("run_id"):
         return None
     stages = record.get("stages") or {}

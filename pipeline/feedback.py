@@ -203,6 +203,8 @@ async def _handle_feedback(repo_path, all_tools, tools_by_name, agent_tools, mod
         log(f"[feedback] #{pull_number}: {record['note']}")
         return record
     request = previous_run.get("request", "")
+    # A run that came from a labelled issue keeps its link to it through a restart or a revision.
+    issue = previous_run.get("issue")
     previous_folder = previous_run.get("task_folder")
     previous_task = load_task(previous_folder) if previous_folder and Path(previous_folder).exists() else None
 
@@ -223,7 +225,7 @@ async def _handle_feedback(repo_path, all_tools, tools_by_name, agent_tools, mod
         record["action"] = RESTARTED
         restart_request = f"{request}\n\nThe previous pull request was closed with this feedback from the owner:\n{text}"
         log(f"[feedback] #{pull_number} is closed with a /revise comment: restarting on a fresh branch")
-        record["run"] = await run_pipeline(repo_path, all_tools, agent_tools, models, restart_request, run_id, task_folder, settings, log)
+        record["run"] = await run_pipeline(repo_path, all_tools, agent_tools, models, restart_request, run_id, task_folder, settings, log, issue=issue)
         return record
     if revisions_done >= settings["feedback"]["max_revisions"]:
         record["action"] = BLOCKED
@@ -238,7 +240,7 @@ async def _handle_feedback(repo_path, all_tools, tools_by_name, agent_tools, mod
     revision = {"branch": branch, "pull_request": pull_number, "feedback": text, "previous_task": previous_task,
                 "number": revisions_done + 1, "max": settings["feedback"]["max_revisions"]}
     log(f"[feedback] #{pull_number}: revision {revision['number']} of {revision['max']} on {branch}")
-    record["run"] = await run_pipeline(repo_path, all_tools, agent_tools, models, request, run_id, task_folder, settings, log, revision=revision)
+    record["run"] = await run_pipeline(repo_path, all_tools, agent_tools, models, request, run_id, task_folder, settings, log, revision=revision, issue=issue)
     return record
 
 

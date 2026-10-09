@@ -23,7 +23,8 @@ load_dotenv(PROJECT_ROOT / ".env")
 FILESYSTEM_SERVER_PACKAGE = "@modelcontextprotocol/server-filesystem"
 # The only GitHub tools the server is started with. Given alone, GITHUB_TOOLS makes the server expose exactly
 # these (verified live against v2.0.2), so merge_pull_request is never offered to anything.
-GITHUB_TOOLS_ALLOWED = ["create_pull_request", "list_pull_requests", "pull_request_read", "add_issue_comment"]
+GITHUB_TOOLS_ALLOWED = ["create_pull_request", "list_pull_requests", "pull_request_read", "add_issue_comment",
+                        "list_issues", "issue_read"]
 
 
 def get_target_repo_path():
@@ -133,6 +134,14 @@ def get_feedback_settings():
     }
 
 
+def get_issue_settings():
+    """Return the issue intake's settings: the label that marks an issue as approved for the pipeline."""
+    return {
+        # Only someone with triage access or more can apply a label, so a labelled issue is one the owner approved.
+        "label": os.environ.get("ISSUE_LABEL", "agent-ready"),
+    }
+
+
 def get_float(name, default):
     """Return the environment variable `name` as a float, or `default` when it is unset."""
     value = os.environ.get(name, str(default))
@@ -193,7 +202,7 @@ def get_github_server_config():
                            "Download the release binary and set its path in .env.")
     if not os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN"):
         raise RuntimeError("GITHUB_PERSONAL_ACCESS_TOKEN is not set. Create a fine-grained token scoped to the "
-                           "target repository with Pull requests read and write, and put it in .env.")
+                           "target repository with Pull requests read and write and Issues read, and put it in .env.")
     return {
         "github": {
             "command": binary,

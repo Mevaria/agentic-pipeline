@@ -28,7 +28,7 @@ from pipeline.author import recursion_limit as author_recursion_limit
 from pipeline.gate import run_gate
 from pipeline.implementer import build_implementer
 from pipeline.implementer import recursion_limit as implementer_recursion_limit
-from pipeline.memory import index_record, recall, recall_block, relevant_hits
+from pipeline.memory import index_record, issue_text, recall, recall_block, relevant_hits
 from pipeline.reporter import report
 from pipeline.tasks import load_task
 from pipeline.tooling import call_tool, current_trace, innermost_error, scrub_secrets, start_trace, stop_trace
@@ -110,7 +110,7 @@ def pipeline_note(revision_number, max_revisions, record):
     )
 
 
-async def run_pipeline(repo_path, all_tools, agent_tools, models, request, run_id, task_folder, settings, log=print, revision=None):
+async def run_pipeline(repo_path, all_tools, agent_tools, models, request, run_id, task_folder, settings, log=print, revision=None, issue=None):
     """Run every stage on one request and return the run record.
 
     all_tools: every MCP tool, for the stages' code steps.
@@ -121,6 +121,9 @@ async def run_pipeline(repo_path, all_tools, agent_tools, models, request, run_i
     revision: None for a fresh run, or {"branch", "pull_request", "feedback", "previous_task", "number", "max"}
         to revise an existing pull request: the author gets the feedback, the implementer continues on the
         branch, the reporter reuses the pull request, and a note is posted on it afterwards.
+    issue: None, or the GitHub issue the request was composed from, {"number", "title", "body", "url", "author",
+        "updated_at", ...}: it is kept in the record as the exact text acted on, memory embeds its own words
+        rather than the composed request, and the pull request body links to it.
     """
     repo = str(Path(repo_path))
     task_folder = Path(task_folder)
@@ -217,9 +220,11 @@ async def run_pipeline(repo_path, all_tools, agent_tools, models, request, run_i
     # Every tool call of the run, by code or by a model, goes to a JSON-lines file next to the record. It is
     # kept under runs/records rather than in the task folder, which a clarification removes.
     started_trace = start_trace(Path(settings["reporter"]["records_path"]) / f"{run_id}-tools.jsonl")
+    # The issue as read at the start of the run, so the record shows exactly which text was acted on.
+    issue_record = {**{key: issue.get(key) for key in ("number", "title", "body", "url", "author", "updated_at")}, "read_at": now()} if issue else None
     record = {
         "run_id": run_id, "request": request, "started": now(), "task_folder": str(task_folder),
-        "tool_log": str(current_trace()),
+        "tool_log": str(current_trace()), "issue": issue_record,
         "stages": {}, "outcome": None, "crashed_in": None, "error": None, "evidence": None, "cleanup": None,
     }
     branch = None
@@ -246,7 +251,8 @@ async def run_pipeline(repo_path, all_tools, agent_tools, models, request, run_i
         # A fresh run first asks memory for similar past runs; a revision already knows its pull request.
         if memory_on and not revision:
             stage = "recall"
-            memory_block = await remember(request)
+            # A run from an issue is recalled on the issue's own words, the same text memory indexes for it.
+            memory_block = await remember(issue_text(issue) if issue else request)
             stage = "author"
             if memory_block:
                 author_input = f"{author_input}\n\n{memory_block}"
@@ -264,6 +270,9 @@ async def run_pipeline(repo_path, all_tools, agent_tools, models, request, run_i
             await notify(BLOCKED, f"The author could not produce failing tests for the request ({state['status']}).")
             return record
         task = {**load_task(task_folder), "request": request}
+        if issue:
+            # The reporter puts "Fixes #N" in the pull request body from this.
+            task["issue"] = issue["number"]
         record["test_files"] = list(task["tests"])
         if revision:
             # Continue on the pull request's branch, with the owner's feedback in the implementer's prompt.

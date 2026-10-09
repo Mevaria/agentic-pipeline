@@ -46,8 +46,11 @@ def pull_request_body(task, review, paragraph, run_id):
     non_blocking = describe_findings(review.get("non_blocking_findings", [])) or "- none"
     test_record = review.get("test_record", {})
     scan = review.get("scan", {})
+    # A run that came from an issue links the pull request to it with the closing keyword GitHub reads from the
+    # body; nothing is written to the issue itself.
+    fixes = f"Fixes #{task['issue']}\n\n" if task.get("issue") else ""
     return (
-        f"## Summary\n\n{paragraph or '_No description was generated for this change._'}\n\n"
+        f"## Summary\n\n{paragraph or '_No description was generated for this change._'}\n\n{fixes}"
         f"## Request\n\n{task['spec']}\n\n"
         f"## Tests added\n\n{tests}\n\n"
         f"## Review\n\n{review.get('summary') or '_No review summary._'}\n\n"
@@ -110,7 +113,7 @@ async def report(repo_path, all_tools, model, task, branch, review, run_id, sett
     record = {
         "run_id": run_id,
         "started": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "task": {key: task.get(key) for key in ("type", "short_description", "spec")},
+        "task": {key: task.get(key) for key in ("type", "short_description", "spec", "issue")},
         "test_files": list(task.get("tests", {})),
         "branch": branch,
         "review": {
