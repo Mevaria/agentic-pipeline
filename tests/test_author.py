@@ -210,6 +210,23 @@ def test_passing_test_is_fed_back_and_revised(repo, tmp_path):
     assert "test_delete_book.py::test_list_books: passes" in agent.prompts_seen[-1]
     assert REQUEST in agent.prompts_seen[-1]
     assert "passes" not in agent.prompts_seen[0]
+    # The revision guidance says how to make a passing test fail, and what must never be done to it.
+    guidance = agent.prompts_seen[-1]
+    assert "asserting something the spec requires that the current code does not do" in guidance
+    assert "Never change an expected value so that it contradicts the spec" in guidance
+    assert "already answers 404" in guidance
+
+
+def test_prompts_warn_about_the_coincidental_404():
+    """Both the system prompt and the revision prompt say that a route which does not exist yet already answers 404, so a not-found test must assert the JSON error body the spec requires."""
+    from pipeline.author import author_system_prompt, revision_prompt
+    system = author_system_prompt("C:/target")
+    assert "never what the current code happens to do" in system and "already answers 404" in system
+    findings = "- tests/test_x.py::test_not_found: passes. passed before any change was made, so it does not test the requested behaviour"
+    revision = revision_prompt(REQUEST, {"type": "feat", "short_description": "x", "spec": "Return 404 with a JSON error.", "tests": {}}, findings)
+    assert findings in revision
+    assert "such as the exact JSON error body" in revision
+    assert "expected status codes and bodies must stay the ones the spec requires" in revision
 
 
 def test_feature_with_passing_tests_is_blocked_at_the_cap(repo, tmp_path):
