@@ -97,6 +97,9 @@ def get_review_settings():
         "max_tool_steps": get_int("MAX_TOOL_STEPS", 12),
         # Whether a second, security-only model call runs after the review over the same evidence.
         "security_pass": get_flag("SECURITY_PASS", False),
+        # When set, the gate sends each change's evidence to the reviewer service at this URL instead of
+        # reviewing in-process. Empty means local.
+        "a2a_url": os.environ.get("REVIEWER_A2A_URL", "").strip(),
     }
 
 

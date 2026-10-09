@@ -9,3 +9,4 @@ pip-audit>=2.7
 pytest>=8.0
 flask>=3.0
 ruff>=0.16
+a2a-sdk[http-server]==1.2.2

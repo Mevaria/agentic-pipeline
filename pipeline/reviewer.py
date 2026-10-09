@@ -280,22 +280,21 @@ class ReviewerState(TypedDict, total=False):
     remaining_passes: list
     # pass name -> the validated submission as a dict, or None when that pass produced no verdict.
     submissions: dict
+    # The model's part of the verdict: validated findings, summary, no_verdict; what a remote reviewer returns.
+    model_verdict: dict
     # The outcome: approved, blocking_findings, non_blocking_findings, summary, no_verdict, plus the evidence.
     result: dict
 
 
-def build_reviewer(repo_path, all_tools, model, settings, log=print):
-    """Build the reviewer graph.
+async def gather_evidence(repo_path, tools_by_name, task, branch, settings, log=print):
+    """Check out the branch and collect every piece of evidence the reviewer may judge from.
 
-    all_tools: every MCP tool, used by code to gather the evidence.
-    model: the chat model; it is bound to submit_review only.
-    settings: base_branch, max_tool_steps, security_pass.
+    This is the only part of a review that needs the MCP servers and the target
+    checkout. The model pass and the verdict are a pure function of what it
+    returns, which is what lets them run behind an A2A boundary.
     """
     repo_path = Path(repo_path)
     repo = str(repo_path)
-    tools_by_name = {tool.name: tool for tool in all_tools}
-    agent_tools = [submit_review]
-    model_with_tools = model.bind_tools(agent_tools)
 
     async def git(name, **arguments):
         """Call a Git server tool; every one of them takes the repository path as repo_path."""
@@ -312,50 +311,139 @@ def build_reviewer(repo_path, all_tools, model, settings, log=print):
         except Exception:
             return None
 
+    status = await git("git_status")
+    if "working tree clean" not in status:
+        raise RuntimeError(f"The target repository has uncommitted changes:\n{status}")
+    await git("git_checkout", branch_name=branch)
+    # The diff is taken against the merge base, so commits added to the base branch after this branch
+    # was created do not show up as if the branch had removed them.
+    diff_result = await dev_tools("diff_against_base")
+    if diff_result.get("error"):
+        raise RuntimeError(diff_result["error"])
+    diff = diff_result["diff"]
+    changed = changed_files_in(diff)
+    changed_files = {}
+    for path in changed:
+        content = await read_file(path)
+        if content is not None:
+            changed_files[path] = content
+    # The test run and the scan are the reviewer's own, not the implementer's claims.
+    test_record = await dev_tools("run_tests")
+    scan = await dev_tools("run_security_scan")
+    format_report = await dev_tools("format_code", fix=False)
+    # The checklist is read from the base branch, not the branch under review, so a change cannot
+    # remove the rule it is judged by, and a branch older than a new rule is still judged by it.
+    conventions = await dev_tools("read_file_on_base", path="CONVENTIONS.md")
+    checklist = checklist_from(conventions.get("content") or "")
+    evidence = {
+        "task": task, "branch": branch, "base_branch": settings["base_branch"],
+        "diff": diff, "changed_files": changed_files, "test_record": test_record, "scan": scan,
+        "format_report": format_report, "checklist": checklist,
+    }
+    log(f"[gather] {len(changed)} changed file(s), tests {'passed' if test_record.get('passed') else 'FAILED'}, "
+        f"scan {'blocking' if scan.get('blocking') else 'clear'}, "
+        f"{len(format_report.get('would_reformat', []))} file(s) unformatted")
+    return evidence
+
+
+def first_pass_state(evidence, settings):
+    """Return the state fields that start the review pass over the given evidence."""
+    return {
+        "evidence": evidence,
+        "reminders": 0,
+        "pass_name": REVIEW_PASS,
+        # The security-only pass is a second model call with the same evidence and only the route questions.
+        "remaining_passes": [SECURITY_PASS] if settings.get("security_pass") else [],
+        "submissions": {},
+        "messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), SystemMessage(reviewer_system_prompt(evidence["checklist"])),
+                     HumanMessage(evidence_prompt(evidence))],
+    }
+
+
+def model_verdict(submissions, evidence):
+    """Reduce the model passes' submissions to validated findings, a summary and whether any pass gave no verdict.
+
+    This is the part of the verdict that depends only on what the model said
+    and the evidence it saw, so it is what a remote reviewer sends back. The
+    downgrade and line rules are applied here.
+    """
+    changed = list(evidence["changed_files"])
+    changed_lines = changed_lines_in(evidence["diff"])
+    findings = []
+    for pass_name, submission in submissions.items():
+        for finding in (submission or {}).get("findings", []):
+            entry = {"source": "model" if pass_name == REVIEW_PASS else pass_name, **finding}
+            path = matching_changed_file(entry["file"], changed)
+            # The downgrade rule: a blocking finding must name a file the diff touches, or it cannot block.
+            if entry["severity"] == "blocking" and path is None:
+                entry["severity"] = "non_blocking"
+                entry["message"] += " (downgraded: the file is not part of this change)"
+            # A line number the diff did not add would mislead the reader of the pull request, so it is dropped.
+            if entry.get("line") is not None and entry["line"] not in changed_lines.get(path, set()):
+                entry["line"] = None
+            findings.append(entry)
+    # No verdict from any pass means the change cannot be judged, which fails closed.
+    missing = [pass_name for pass_name, submission in submissions.items() if submission is None]
+    no_verdict = bool(missing) or REVIEW_PASS not in submissions
+    # The pull request summary comes from the review pass; the security pass adds its sentence only when it found something.
+    review = submissions.get(REVIEW_PASS) or {}
+    security = submissions.get(SECURITY_PASS) or {}
+    summary = review.get("summary", "")
+    if security.get("findings"):
+        summary = f"{summary} Security pass: {security.get('summary', '')}".strip()
+    return {"findings": findings, "summary": summary, "no_verdict": no_verdict,
+            "missing_passes": missing or ([REVIEW_PASS] if REVIEW_PASS not in submissions else [])}
+
+
+def assemble_result(verdict, evidence, branch, log=print):
+    """Combine the model's verdict with the code-decided findings from the evidence into the review result."""
+    findings = list(verdict["findings"]) + scan_findings(evidence["scan"]) + format_findings(evidence["format_report"])
+    # The reviewer's own test run failing is blocking whatever the implementer reported.
+    if not evidence["test_record"].get("passed"):
+        findings.append({"source": "tests", "item": "tests", "severity": "blocking", "file": NO_FILE, "line": None,
+                         "message": f"the tests fail on the branch: {evidence['test_record'].get('summary', '')}"})
+    if verdict["no_verdict"]:
+        findings.append({"source": "reviewer", "item": "review", "severity": "blocking", "file": NO_FILE, "line": None,
+                         "message": f"the reviewer did not submit a review ({', '.join(verdict.get('missing_passes') or [REVIEW_PASS])} pass)"})
+    blocking = [finding for finding in findings if finding["severity"] == "blocking"]
+    non_blocking = [finding for finding in findings if finding["severity"] != "blocking"]
+    result = {
+        "approved": not blocking,
+        "blocking_findings": blocking,
+        "non_blocking_findings": non_blocking,
+        "summary": verdict["summary"],
+        "no_verdict": verdict["no_verdict"],
+        "branch": branch,
+        "test_record": evidence["test_record"],
+        "scan": evidence["scan"],
+        "diff": evidence["diff"],
+    }
+    log(f"[verdict] {'approved' if result['approved'] else 'changes requested'}: "
+        f"{len(blocking)} blocking, {len(non_blocking)} non-blocking")
+    return result
+
+
+def build_reviewer(repo_path, all_tools, model, settings, log=print, provided_evidence=False):
+    """Build the reviewer graph.
+
+    all_tools: every MCP tool, used by code to gather the evidence.
+    model: the chat model; it is bound to submit_review only.
+    settings: base_branch, max_tool_steps, security_pass.
+    provided_evidence: True to start from evidence given in the input state instead of gathering it,
+        which is how the A2A reviewer service runs the same graph without any repository access.
+    """
+    tools_by_name = {tool.name: tool for tool in all_tools}
+    agent_tools = [submit_review]
+    model_with_tools = model.bind_tools(agent_tools)
+
     async def gather(state):
-        """Code node: check out the branch and collect every piece of evidence the reviewer may use."""
-        status = await git("git_status")
-        if "working tree clean" not in status:
-            raise RuntimeError(f"The target repository has uncommitted changes:\n{status}")
-        await git("git_checkout", branch_name=state["branch"])
-        # The diff is taken against the merge base, so commits added to the base branch after this branch
-        # was created do not show up as if the branch had removed them.
-        diff_result = await dev_tools("diff_against_base")
-        if diff_result.get("error"):
-            raise RuntimeError(diff_result["error"])
-        diff = diff_result["diff"]
-        changed = changed_files_in(diff)
-        changed_files = {}
-        for path in changed:
-            content = await read_file(path)
-            if content is not None:
-                changed_files[path] = content
-        # The test run and the scan are the reviewer's own, not the implementer's claims.
-        test_record = await dev_tools("run_tests")
-        scan = await dev_tools("run_security_scan")
-        format_report = await dev_tools("format_code", fix=False)
-        # The checklist is read from the base branch, not the branch under review, so a change cannot
-        # remove the rule it is judged by, and a branch older than a new rule is still judged by it.
-        conventions = await dev_tools("read_file_on_base", path="CONVENTIONS.md")
-        checklist = checklist_from(conventions.get("content") or "")
-        evidence = {
-            "task": state["task"], "branch": state["branch"], "base_branch": settings["base_branch"],
-            "diff": diff, "changed_files": changed_files, "test_record": test_record, "scan": scan,
-            "format_report": format_report, "checklist": checklist,
-        }
-        log(f"[gather] {len(changed)} changed file(s), tests {'passed' if test_record.get('passed') else 'FAILED'}, "
-            f"scan {'blocking' if scan.get('blocking') else 'clear'}, "
-            f"{len(format_report.get('would_reformat', []))} file(s) unformatted")
-        return {
-            "evidence": evidence,
-            "reminders": 0,
-            "pass_name": REVIEW_PASS,
-            # The security-only pass is a second model call with the same evidence and only the route questions.
-            "remaining_passes": [SECURITY_PASS] if settings.get("security_pass") else [],
-            "submissions": {},
-            "messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), SystemMessage(reviewer_system_prompt(checklist)),
-                         HumanMessage(evidence_prompt(evidence))],
-        }
+        """Code node: check out the branch, collect the evidence, and start the review pass."""
+        evidence = await gather_evidence(repo_path, tools_by_name, state["task"], state["branch"], settings, log)
+        return first_pass_state(evidence, settings)
+
+    def start(state):
+        """Code node: start the review pass from the evidence the caller provided."""
+        return first_pass_state(state["evidence"], settings)
 
     async def reviewer(state):
         """Model node: one turn, which should end in a submit_review call."""
@@ -411,60 +499,15 @@ def build_reviewer(repo_path, all_tools, model, settings, log=print):
         }
 
     def verdict(state):
-        """Code node: validate the model's findings, add the code-decided ones, and derive the outcome."""
+        """Code node: reduce the model's submissions to a verdict, then combine it with the code-decided findings."""
         evidence = state["evidence"]
-        changed = list(evidence["changed_files"])
-        changed_lines = changed_lines_in(evidence["diff"])
-        submissions = state["submissions"]
-        model_findings = []
-        for pass_name, submission in submissions.items():
-            for finding in (submission or {}).get("findings", []):
-                entry = {"source": "model" if pass_name == REVIEW_PASS else pass_name, **finding}
-                path = matching_changed_file(entry["file"], changed)
-                # The downgrade rule: a blocking finding must name a file the diff touches, or it cannot block.
-                if entry["severity"] == "blocking" and path is None:
-                    entry["severity"] = "non_blocking"
-                    entry["message"] += " (downgraded: the file is not part of this change)"
-                # A line number the diff did not add would mislead the reader of the pull request, so it is dropped.
-                if entry.get("line") is not None and entry["line"] not in changed_lines.get(path, set()):
-                    entry["line"] = None
-                model_findings.append(entry)
-        findings = model_findings + scan_findings(evidence["scan"]) + format_findings(evidence["format_report"])
-        # The reviewer's own test run failing is blocking whatever the implementer reported.
-        if not evidence["test_record"].get("passed"):
-            findings.append({"source": "tests", "item": "tests", "severity": "blocking", "file": NO_FILE, "line": None,
-                             "message": f"the tests fail on the branch: {evidence['test_record'].get('summary', '')}"})
-        # No verdict from any pass means the change cannot be judged, which fails closed.
-        missing = [pass_name for pass_name, submission in submissions.items() if submission is None]
-        no_verdict = bool(missing) or REVIEW_PASS not in submissions
-        if no_verdict:
-            findings.append({"source": "reviewer", "item": "review", "severity": "blocking", "file": NO_FILE, "line": None,
-                             "message": f"the reviewer did not submit a review ({', '.join(missing) or REVIEW_PASS} pass)"})
-        blocking = [finding for finding in findings if finding["severity"] == "blocking"]
-        non_blocking = [finding for finding in findings if finding["severity"] != "blocking"]
-        # The pull request summary comes from the review pass; the security pass adds its sentence only when it found something.
-        review = submissions.get(REVIEW_PASS) or {}
-        security = submissions.get(SECURITY_PASS) or {}
-        summary = review.get("summary", "")
-        if security.get("findings"):
-            summary = f"{summary} Security pass: {security.get('summary', '')}".strip()
-        result = {
-            "approved": not blocking,
-            "blocking_findings": blocking,
-            "non_blocking_findings": non_blocking,
-            "summary": summary,
-            "no_verdict": no_verdict,
-            "branch": state["branch"],
-            "test_record": evidence["test_record"],
-            "scan": evidence["scan"],
-            "diff": evidence["diff"],
-        }
-        log(f"[verdict] {'approved' if result['approved'] else 'changes requested'}: "
-            f"{len(blocking)} blocking, {len(non_blocking)} non-blocking")
-        return {"result": result}
+        model_part = model_verdict(state["submissions"], evidence)
+        result = assemble_result(model_part, evidence, evidence.get("branch", state.get("branch", "")), log)
+        return {"model_verdict": model_part, "result": result}
 
     graph = StateGraph(ReviewerState)
-    graph.add_node("gather", gather)
+    # Locally the evidence is gathered from the servers; the A2A service receives it ready-made.
+    graph.add_node("gather", start if provided_evidence else gather)
     graph.add_node("reviewer", reviewer)
     graph.add_node("tools", ToolNode(agent_tools, handle_tool_errors=True))
     graph.add_node("remind", remind)

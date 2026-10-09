@@ -11,8 +11,26 @@ findings. Nothing here pushes or notifies; the reporter does that.
 
 from pipeline.implementer import build_implementer
 from pipeline.implementer import recursion_limit as implementer_recursion_limit
-from pipeline.reviewer import build_reviewer, describe_findings
+from pipeline.reviewer import assemble_result, build_reviewer, describe_findings, gather_evidence
 from pipeline.reviewer import recursion_limit as reviewer_recursion_limit
+
+
+async def review_branch(repo_path, all_tools, reviewer_model, task, branch, review_settings, log=print):
+    """Review one branch, locally or through the A2A reviewer service when a2a_url is set, and return the result."""
+    url = review_settings.get("a2a_url")
+    if not url:
+        graph = build_reviewer(repo_path, all_tools, reviewer_model, review_settings, log)
+        state = await graph.ainvoke({"task": task, "branch": branch}, {"recursion_limit": reviewer_recursion_limit(review_settings)})
+        return state["result"]
+    # Remote: the evidence is still gathered here, where the servers are; only the model pass crosses the network.
+    from pipeline.a2a_reviewer import remote_model_verdict
+
+    tools_by_name = {tool.name: tool for tool in all_tools}
+    evidence = await gather_evidence(repo_path, tools_by_name, task, branch, review_settings, log)
+    verdict = await remote_model_verdict(url, evidence, review_settings.get("a2a_httpx_client"), log)
+    result = assemble_result(verdict, evidence, branch, log)
+    result["reviewer"] = url
+    return result
 
 
 async def run_gate(repo_path, all_tools, implementer_tools, implementer_model, reviewer_model, task, branch,
@@ -23,15 +41,13 @@ async def run_gate(repo_path, all_tools, implementer_tools, implementer_model, r
     results in order (rounds), the implementer states for the fix attempts
     (fixes), and the final review (review).
     """
-    reviewer_graph = build_reviewer(repo_path, all_tools, reviewer_model, review_settings, log)
     implementer_graph = build_implementer(repo_path, all_tools, implementer_tools, implementer_model, implementer_settings, log)
     rounds = []
     fixes = []
     for round_number in range(1, review_settings["max_review_rounds"] + 1):
-        log(f"[gate] review round {round_number} of {review_settings['max_review_rounds']} on {branch}")
-        state = await reviewer_graph.ainvoke({"task": task, "branch": branch},
-                                             {"recursion_limit": reviewer_recursion_limit(review_settings)})
-        review = state["result"]
+        log(f"[gate] review round {round_number} of {review_settings['max_review_rounds']} on {branch}"
+            + (f" via {review_settings['a2a_url']}" if review_settings.get("a2a_url") else ""))
+        review = await review_branch(repo_path, all_tools, reviewer_model, task, branch, review_settings, log)
         rounds.append(review)
         if review["approved"]:
             return {"status": "approved", "rounds": rounds, "fixes": fixes, "review": review}
