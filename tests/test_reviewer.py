@@ -121,11 +121,21 @@ def repo(tmp_path, monkeypatch):
     return work
 
 
-def build_branch(repo, app_content):
+# A route that answers 500 for a missing book, and the test that was bent to expect it so that it would be red
+# before the change: on main the route does not exist and Flask's own 404 would have matched a 404 check.
+APP_WRONG_NOT_FOUND = APP.replace("    return app\n", DELETE_ROUTE.format(status=204).replace("), 404", "), 500"))
+WRONG_NOT_FOUND_TEST = GIVEN_TEST + '''
+
+def test_delete_missing_book():
+    assert create_app().test_client().delete("/api/books/999").status_code == 500
+'''
+
+
+def build_branch(repo, app_content, test_content=GIVEN_TEST):
     """Commit the given app.py and the given test on the delete-book branch, as the implementer would, then return to main."""
     git(["checkout", "-b", BRANCH], repo)
     (repo / "app.py").write_text(app_content)
-    (repo / "tests" / "test_delete_book.py").write_text(GIVEN_TEST)
+    (repo / "tests" / "test_delete_book.py").write_text(test_content)
     git(["add", "."], repo)
     git(["commit", "-m", "feat: add delete route"], repo)
     git(["checkout", "main"], repo)
@@ -255,6 +265,28 @@ def test_verdict_is_derived_from_the_findings(repo, tmp_path):
     assert result["approved"] is False
     assert [finding["item"] for finding in result["blocking_findings"]] == ["scope"]
     assert result["blocking_findings"][0]["source"] == "model"
+
+
+def test_test_contradicting_the_spec_is_a_blocking_finding_on_the_test_file(repo, tmp_path):
+    """With a branch whose test expects 500 where the spec requires 404, a reviewer that submits a blocking tests_match_spec finding on the test file blocks the change: the item is accepted by submit_review, the test file counts as changed so the finding is not downgraded, and the reviewer was asked to check every assertion against the spec and shown the test."""
+    spec = SPEC + " A missing book returns 404 with {\"error\": \"Book not found\"}."
+    (tmp_path / "task" / "task.json").write_text(json.dumps({"type": "feat", "short_description": "delete-book", "spec": spec}))
+    (tmp_path / "task" / "tests" / "test_delete_book.py").write_text(WRONG_NOT_FOUND_TEST)
+    build_branch(repo, APP_WRONG_NOT_FOUND, WRONG_NOT_FOUND_TEST)
+    finding = {"item": "tests_match_spec", "severity": "blocking", "file": "tests/test_delete_book.py", "line": 11,
+               "message": "test_delete_missing_book expects 500; the spec requires 404 with a JSON error body"}
+    agent = ScriptedAgent([submit([finding], "The not-found test contradicts the spec.", 1)])
+    result = asyncio.run(run_review(repo, agent, tmp_path))
+    assert result["approved"] is False
+    assert result["test_record"]["passed"] is True
+    assert [(entry["item"], entry["severity"], entry["file"]) for entry in result["blocking_findings"]] == [("tests_match_spec", "blocking", "tests/test_delete_book.py")]
+    assert "downgraded" not in result["blocking_findings"][0]["message"]
+    shown = agent.prompts_seen[0]
+    assert "status_code == 500" in shown and spec in shown
+    # The system prompt asks the question; the agent records only the human message, so it is checked directly.
+    from pipeline.reviewer import TEST_QUESTIONS, checklist_from, reviewer_system_prompt
+    assert TEST_QUESTIONS in reviewer_system_prompt(checklist_from(CONVENTIONS))
+    assert "tests_match_spec" in reviewer_system_prompt(checklist_from(CONVENTIONS))
 
 
 def test_non_blocking_findings_still_approve(repo, tmp_path):

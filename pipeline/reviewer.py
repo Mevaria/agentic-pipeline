@@ -52,6 +52,12 @@ ROUTE_QUESTIONS = (
     "(information_exposure)\n"
     "3. Is any request input used before it is validated? (input_validation)"
 )
+# The question about the tests, asked only in the full review pass, which sees the spec and the test files.
+TEST_QUESTIONS = (
+    "For each test file shown, check every assertion against the spec: do the expected status codes and response "
+    "bodies match what the spec requires? A test that expects something the spec does not say, such as 500 where "
+    "the spec requires 404, is a blocking tests_match_spec finding on that test file, named as the diff names it."
+)
 # Names of the model passes: the full review, and the optional security-only second call.
 REVIEW_PASS, SECURITY_PASS = "review", "security"
 # Characters of each gathered text kept in the prompt, so one large file cannot push the rest out of context.
@@ -66,7 +72,7 @@ NO_FILE = ""
 class Finding(BaseModel):
     """One finding from the reviewer, about one checklist item in one file."""
 
-    item: Literal["input_validation", "secrets", "information_exposure", "scope"] = Field(
+    item: Literal["input_validation", "secrets", "information_exposure", "scope", "tests_match_spec"] = Field(
         description="The checklist item the finding is about."
     )
     severity: Literal["blocking", "non_blocking"] = Field(description="blocking only if it must be fixed before merge.")
@@ -178,8 +184,10 @@ def reviewer_system_prompt(checklist):
         "by a formatter. Do not comment on those.\n"
         "Judge the remaining items: input validated before use (input_validation), no secrets or credentials "
         "in the code (secrets), no route exposing internal configuration, environment or debug information "
-        "(information_exposure), and the change staying within the scope of the request (scope).\n"
+        "(information_exposure), the change staying within the scope of the request (scope), and every test "
+        "asserting what the spec requires (tests_match_spec).\n"
         f"{ROUTE_QUESTIONS}\n"
+        f"{TEST_QUESTIONS}\n"
         "Rules:\n"
         "- Base every finding on the diff and the changed files shown; name the file as the diff names it.\n"
         "- Mark a finding blocking only if it must be fixed before merge.\n"
