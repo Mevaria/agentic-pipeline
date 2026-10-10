@@ -40,7 +40,7 @@ The run ends with a pull request link on your copy of the target, or with a ques
 
 | Requirement | Why |
 |---|---|
-| Python 3.14 | Everything was verified on 3.14 on Windows, where the frozen Chroma environment was produced. Only the early server tests also ran on 3.12 on Linux |
+| Python 3.14 | Everything was verified on 3.14 on Windows, where the frozen Chroma environment was produced. Only the early server and implementer tests also ran on 3.12 on Linux |
 | Node.js | Runs the reference Filesystem MCP server through `npx` |
 | Ollama 0.20.0 or later, with `gemma4:e4b` pulled | Serves the local model; Gemma 4 needs this version or newer |
 | Git, signed in to GitHub | Branches are pushed with your git sign-in; no token is needed for pushing |
@@ -56,7 +56,7 @@ The pipeline needs a GitHub repository it may push branches to and open pull req
 3. Create a fine-grained token scoped to your copy with the permissions above.
 4. Optional, to mirror the original: a ruleset on `main` that forbids deletion and force pushes and requires every change to go through a pull request. The pipeline never touches `main` either way.
 
-Any other repository works if it has `pytest.ini`, a `tests` folder, a `CONVENTIONS.md` with a review checklist, and an origin on GitHub.
+Any other repository works if it has `pytest.ini`, a `tests` folder and an origin on GitHub. A `CONVENTIONS.md` with a `## Review checklist` section is optional: without one, the reviewer applies its built-in four-item checklist (input validation, secrets, information exposure, scope).
 
 ## Setup
 
@@ -123,7 +123,7 @@ python -m pipeline.run_issues --issue 5    # issue 5 again: your explicit re-app
 python -m pipeline.run_feedback <pull request number>
 ```
 
-An open pull request is revised on its branch and a note is posted on it; a closed one restarts on a fresh branch; a merged one is recorded as accepted. Each stage also has its own runner (`run_author`, `run_implementer`, `run_review`, `run_report`), described in the design document.
+An open pull request with a new `/revise` comment is revised on its branch and a note is posted on it; a closed one with a `/revise` comment restarts on a fresh branch; a merged one is recorded as accepted; anything else is only recorded. Each stage also has its own runner (`run_author`, `run_implementer`, `run_review`, `run_report`), described in the design document.
 
 ## What a run leaves behind
 
@@ -151,4 +151,6 @@ pytest
 - **An issue can change between the owner's label and the pipeline's first read.** No GitHub server tool exposes label or edit times; the record stores the exact text acted on, and the owner reviews the pull request before any merge.
 - **Ollama can crash on a cold model load when host memory is nearly exhausted.** Warm the model with any small request first.
 - **The A2A service has no authentication** and listens on localhost only.
-- **Windows paths** are used in the examples; the code is path-agnostic, but only the early server tests ran outside Windows.
+- **The reviewer is the same model as the implementer**, so it may favour code its own model wrote; the code-decided findings and the derived verdict limit this but do not remove it.
+- **The defence against instructions injected in issue text** has scripted tests plus one live run only.
+- **Windows paths** are used in the examples; the code is path-agnostic, but only the early server and implementer tests ran outside Windows.

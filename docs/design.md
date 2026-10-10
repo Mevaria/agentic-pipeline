@@ -4,7 +4,7 @@ The design behind the pipeline described in the [README](../README.md): each age
 
 Contents: [MCP servers](#mcp-servers) · [Tool allowlists](#tool-allowlists) · [Spec and test author](#spec-and-test-author) · [Implementer](#implementer) · [Reviewer and review gate](#reviewer-and-review-gate) · [Reporter](#reporter) · [Orchestrator](#orchestrator) · [Pull request feedback](#pull-request-feedback) · [Issue intake](#issue-intake) · [Memory](#memory) · [Reviewer over A2A](#reviewer-over-a2a) · [Settings](#settings) · [Notes](#notes) · [Design changes from the submitted design](#design-changes-from-the-submitted-design)
 
-The target used throughout is `reading_list`, a small Flask app with a JSON API, one HTML page, a pytest suite and a `CONVENTIONS.md` that holds the coding rules, the git rules and the review checklist. The pipeline is not specific to it: it reads the checklist from the target and works on any repository that has `pytest.ini`, a `tests` folder and an origin on GitHub. Everything that needs no judgement, from branching to the final verdict, is done by code rather than by a model. Nothing is ever merged by the system and nothing is pushed to the base branch.
+The target used throughout is `reading_list`, a small Flask app with a JSON API, one HTML page, a pytest suite and a `CONVENTIONS.md` that holds the coding rules, the git rules and the review checklist. The pipeline is not specific to it: it works on any repository that has `pytest.ini`, a `tests` folder and an origin on GitHub, and reads the review checklist from the target's `CONVENTIONS.md` when that file has a `## Review checklist` section, falling back to a built-in four-item checklist (input validation, secrets, information exposure, scope) when it does not. Everything that needs no judgement, from branching to the final verdict, is done by code rather than by a model. Nothing is ever merged by the system and nothing is pushed to the base branch.
 
 ## MCP servers
 
@@ -295,8 +295,21 @@ All settings are read from `.env`; `.env.example` lists them with comments.
 
 `mcp` is pinned below version 2 because `langchain-mcp-adapters` and `mcp-server-git` both require it, and FastMCP was renamed in 2.x. Subprocesses started by the dev tools server get an empty stdin, because a pytest run that inherited the MCP protocol channel hung on Windows.
 
-The full pipeline, memory, the A2A reviewer and the issue intake were verified on Python 3.14 on Windows only, and `requirements-chroma.txt` is frozen from that interpreter. The early server tests also ran on Python 3.12 on Linux; nothing built after them has been run there.
+The full pipeline, memory, the A2A reviewer and the issue intake were verified on Python 3.14 on Windows only, and `requirements-chroma.txt` is frozen from that interpreter. The early server and implementer tests also ran on Python 3.12 on Linux; nothing built after them has been run there.
 
 ## Design changes from the submitted design
 
-Made while building: the reviewer no longer decides severity blocking, the scan computes it in code and the reviewer judges scope and the checklist items; the implementer no longer branches or commits itself, code does both at fixed points; the merge tool is excluded by the GitHub server's configuration rather than forbidden by prompt; the review trigger after a pull request is an explicit `/revise` comment rather than a changes-requested review, because the pull request author cannot request changes on GitHub; and a formatter runs before every commit so that formatting is never a review matter.
+Made while building:
+
+- The planner was folded into the spec and test author, since the spec and the tests are the plan and a separate planning agent only restated them.
+- The reporter became a code step with one model call rather than an agent, because pushing, opening and notifying need no judgement and the one paragraph of prose does.
+- The author's revise step is code feedback, one line per test saying why it was not red, rather than a model reflection, so Reflexion lives only in the implementer.
+- Clarification became an explicit `request_clarification` tool with fixed reasons rather than detecting a question in the text, so the attempt ends in code the moment the tool accepts the call.
+- The reviewer no longer decides whether a finding blocks: the scan computes blocking in code and the reviewer judges scope and the checklist items.
+- The implementer no longer branches or commits itself; code does both at fixed points.
+- The merge tool is excluded by the GitHub server's configuration rather than forbidden by prompt.
+- The review trigger after a pull request is an explicit `/revise` comment rather than a changes-requested review, because the pull request author cannot request changes on GitHub.
+- A formatter runs before every commit so that formatting is never a review matter.
+- Issue intake was added, with the label not consumed on pickup because the only tool that changes labels also edits and closes issues, so re-runs are an explicit `--issue N`.
+- The security-only second review pass was built, measured and left off by default, because it found nothing the single pass had not and added duplicate findings.
+- The implementer's tools were cut to four, because `directory_tree` flooded the model with `.git` contents and `edit_file` needs exact text matches a small model fumbles.
